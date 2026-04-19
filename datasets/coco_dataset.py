@@ -66,9 +66,9 @@ class COCOPairDataset(Dataset):
             image_aug1 = TRAIN_AUGMENT(image)
             image_aug2 = TRAIN_AUGMENT(image)
         else:
-            base = EVAL_TRANSFORM(image)
-            image_aug1 = base
-            image_aug2 = base
+            # Use two independent views so image-image retrieval has a real positive pair.
+            image_aug1 = TRAIN_AUGMENT(image)
+            image_aug2 = TRAIN_AUGMENT(image)
 
         input_ids, attention_mask = self._tokenize(item["caption"])
 

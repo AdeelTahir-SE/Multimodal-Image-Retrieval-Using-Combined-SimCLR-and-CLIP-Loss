@@ -14,24 +14,32 @@ from models.text_encoder import TextEncoder
 
 @torch.no_grad()
 def encode_embeddings(image_encoder, text_encoder, dataloader, device):
-    image_embeds: List[torch.Tensor] = []
+    image_query_embeds: List[torch.Tensor] = []
+    image_gallery_embeds: List[torch.Tensor] = []
     text_embeds: List[torch.Tensor] = []
 
     image_encoder.eval()
     text_encoder.eval()
 
     for batch in tqdm(dataloader, desc="Encoding"):
-        images = batch["image_aug1"].to(device)
+        images_q = batch["image_aug1"].to(device)
+        images_g = batch["image_aug2"].to(device)
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
 
-        z_img = image_encoder(images)
+        z_img_q = image_encoder(images_q)
+        z_img_g = image_encoder(images_g)
         z_txt = text_encoder(input_ids, attention_mask)
 
-        image_embeds.append(F.normalize(z_img, dim=1).cpu())
+        image_query_embeds.append(F.normalize(z_img_q, dim=1).cpu())
+        image_gallery_embeds.append(F.normalize(z_img_g, dim=1).cpu())
         text_embeds.append(F.normalize(z_txt, dim=1).cpu())
 
-    return torch.cat(image_embeds, dim=0), torch.cat(text_embeds, dim=0)
+    return (
+        torch.cat(image_query_embeds, dim=0),
+        torch.cat(image_gallery_embeds, dim=0),
+        torch.cat(text_embeds, dim=0),
+    )
 
 
 def recall_at_k(similarity: torch.Tensor, ks: Iterable[int]) -> dict:
@@ -94,13 +102,10 @@ def main() -> None:
     image_encoder.load_state_dict(checkpoint["image_encoder"])
     text_encoder.load_state_dict(checkpoint["text_encoder"])
 
-    img_emb, txt_emb = encode_embeddings(image_encoder, text_encoder, dataloader, device)
+    img_q_emb, img_g_emb, txt_emb = encode_embeddings(image_encoder, text_encoder, dataloader, device)
 
-    sim_i2i = img_emb @ img_emb.t()
-    sim_t2i = txt_emb @ img_emb.t()
-
-    # Exclude each image itself for image-to-image retrieval.
-    sim_i2i.fill_diagonal_(-1e9)
+    sim_i2i = img_q_emb @ img_g_emb.t()
+    sim_t2i = txt_emb @ img_g_emb.t()
 
     i2i_metrics = recall_at_k(sim_i2i, args.k)
     t2i_metrics = recall_at_k(sim_t2i, args.k)
