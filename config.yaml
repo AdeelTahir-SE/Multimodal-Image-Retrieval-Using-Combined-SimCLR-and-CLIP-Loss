@@ -1,27 +1,27 @@
 data:
   pairs_json: data/coco_pairs.json
-  subset_size: 20000
-  batch_size: 128
-  num_workers: 4
-  max_length: 77
+  subset_size: 2000        # was 20000 — RAM is your limit, not VRAM
+  batch_size: 16           # was 128 — contrastive loss still works, just weaker signal
+  num_workers: 2           # was 4 — i5-10210U has 4 cores, leave 2 for OS
+  max_length: 77           # fine, keep
 
 model:
-  embedding_dim: 256
-  image_backbone: resnet50
-  text_backbone: distilbert-base-uncased
-  image_pretrained: false
-  text_pretrained: false
+  embedding_dim: 128       # was 256 — smaller = faster matmuls on CPU
+  image_backbone: resnet18 # was resnet50 — half the parameters, much faster
+  text_backbone: distilbert-base-uncased  # already the lightest option, keep
+  image_pretrained: true   # IMPORTANT: set true — pretrained weights converge faster
+  text_pretrained: true    # same reason — you can't afford to train from scratch
 
 loss:
   alpha: 0.5
   beta: 0.5
-  simclr_temperature: 0.07
-  clip_temperature: 0.07
+  simclr_temperature: 0.1  # was 0.07 — slightly softer, more stable with small batches
+  clip_temperature: 0.07   # keep — standard for CLIP-style alignment
 
 training:
-  epochs: 50
-  lr: 3.0e-4
-  weight_decay: 1.0e-4
-  warmup_epochs: 5
+  epochs: 10               # was 50 — each epoch will still take 10-20 min on CPU
+  lr: 3.0e-4               # fine, keep
+  weight_decay: 1.0e-4     # fine, keep
+  warmup_epochs: 2         # was 5 — scaled down with epoch count
   checkpoint_dir: checkpoints
-  device: cuda
+  device: cpu              # was cuda — you have no CUDA
