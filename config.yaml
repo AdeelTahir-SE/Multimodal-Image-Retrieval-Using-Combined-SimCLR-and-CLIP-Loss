@@ -1,0 +1,27 @@
+data:
+  pairs_json: data/coco_pairs.json
+  subset_size: 20000
+  batch_size: 128
+  num_workers: 4
+  max_length: 77
+
+model:
+  embedding_dim: 256
+  image_backbone: resnet50
+  text_backbone: distilbert-base-uncased
+  image_pretrained: false
+  text_pretrained: false
+
+loss:
+  alpha: 0.5
+  beta: 0.5
+  simclr_temperature: 0.07
+  clip_temperature: 0.07
+
+training:
+  epochs: 50
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  warmup_epochs: 5
+  checkpoint_dir: checkpoints
+  device: cuda
