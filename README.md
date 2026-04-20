@@ -1,10 +1,12 @@
 ﻿# Multimodal Image Retrieval (SimCLR + CLIP)
 
-This project trains a shared embedding space for image and text retrieval using a weighted combination of SimCLR and CLIP losses.
+This project trains a shared embedding space for image and text retrieval with a weighted SimCLR + CLIP objective.
 
-## 1. Setup
+# Multimodal Image Retrieval (SimCLR + CLIP)
 
-Create and activate a virtual environment, then install dependencies.
+This project trains a shared embedding space for image and text retrieval, then serves retrieval via CLI and a desktop UI.
+
+## 1. Environment Setup
 
 ### Windows (PowerShell)
 
@@ -24,48 +26,50 @@ pip install -r requirements.txt
 
 ## 2. Download COCO Data
 
-The provided script is bash-based.
+The script downloads and extracts:
 
-### Linux or macOS
+- train2017 images
+- val2017 images
+- annotations_trainval2017
+
+Run:
 
 ```bash
 bash data/download_coco.sh
 ```
 
-### Windows
-
-Use Git Bash, WSL, or manually download these files into data/coco:
-
-- http://images.cocodataset.org/zips/train2017.zip
-- http://images.cocodataset.org/annotations/annotations_trainval2017.zip
-
-After download, extract so these paths exist:
+After completion, you should have:
 
 - data/coco/train2017
+- data/coco/val2017
 - data/coco/annotations/captions_train2017.json
+- data/coco/annotations/captions_val2017.json
 
 ## 3. Build Training Pairs JSON
 
-Creates image-caption pairs from COCO captions and optionally samples a subset.
+Build flattened image-caption pairs used by training/evaluation.
+
+Small subset:
 
 ```bash
 python data/preprocess.py --subset_size 20000 --output data/coco_pairs.json
 ```
 
-If you want full train set pairs, omit subset_size:
+Full train captions:
 
 ```bash
 python data/preprocess.py --output data/coco_pairs.json
 ```
 
-## 4. Configure Training
+## 4. Configure
 
-Edit config.yaml as needed:
+Edit config file (for example config.yaml or collab.config.yaml):
 
-- data.pairs_json: path to generated pairs file
-- data.batch_size: reduce if GPU memory is limited
-- model.image_pretrained and model.text_pretrained: default false
-- loss.alpha and loss.beta: weight SimCLR vs CLIP
+- data.pairs_json
+- data.batch_size
+- data.num_workers
+- model settings
+- training settings
 
 ## 5. Train
 
@@ -73,40 +77,132 @@ Edit config.yaml as needed:
 python train.py --config config.yaml
 ```
 
-Outputs:
+Outputs in checkpoint_dir (default checkpoints):
 
-- checkpoints/latest.pt
-- checkpoints/best.pt
-- checkpoints/train_metrics.jsonl
+- latest.pt
+- best.pt
+- train_metrics.jsonl
 
-## 6. Evaluate Retrieval
+## 6. Evaluate Model Quality
+
+Use the rewritten evaluator for stronger diagnostics.
 
 ```bash
-python evaluate.py --config config.yaml --checkpoint checkpoints/best.pt --k 1 5 10
+python evaluate.py --config config.yaml --checkpoint checkpoints/best.pt --k 1 5 10 --eval_passes 3 --num_examples 5
 ```
 
-Printed metrics:
+What it reports:
 
-- Image->Image Recall@K
-- Text->Image Recall@K
+- Image->Image, Text->Image, and Image->Text metrics
+- R@K, random baseline, and lift over random
+- MRR, MedR, MeanR
+- Stability across passes (std), useful because eval uses stochastic image views
+- A plain-language verdict (Strong / Promising / Weak / Poor)
+- Qualitative text->image examples
 
-## 7. Quick Smoke Test (Optional)
+Optional JSON report:
 
-For a quick sanity run, temporarily lower in config.yaml:
+```bash
+python evaluate.py --config config.yaml --checkpoint checkpoints/best.pt --save_json checkpoints/eval_report.json
+```
 
-- training.epochs: 1
-- data.batch_size: 8 or 16
-- data.num_workers: 0 (helps on some Windows setups)
+## 7. Retrieval from Command Line
 
-Then run train and evaluate commands above.
+Text query:
+
+```bash
+python retrieve.py --config collab.config.yaml --checkpoint checkpoints/best.pt --image_dir data/coco/val2017 --query_text "an athlete playing tennis" --top_k 50
+```
+
+Image query:
+
+```bash
+python retrieve.py --config collab.config.yaml --checkpoint checkpoints/best.pt --image_dir data/coco/val2017 --query_image data/coco/val2017/000000033368.jpg --top_k 50
+```
+
+Notes:
+
+- Gallery indexing is cached under .cache/retrieval by default
+- Use --rebuild_cache to force refresh
+- Progress bar is shown while indexing images
+
+## 8. Retrieval Desktop UI
+
+Run:
+
+```bash
+python retrieve_ui.py
+```
+
+In the UI:
+
+1. Set config/checkpoint/image_dir/cache_dir
+2. Click Load Index
+3. Choose Text or Image Path query
+4. Click Search
+
+The UI renders result images with score and path instead of only printing ranked lines.
+
+## 9. Suggested End-to-End Flow
+
+1. Download COCO data
+2. Build pairs JSON
+3. Train model
+4. Evaluate model (check verdict + lift over random)
+5. Run retrieve.py for quick checks
+6. Use retrieve_ui.py for visual inspection
 
 ## Project Files
 
 - data/preprocess.py: COCO caption pairing and subset sampling
-- datasets/coco_dataset.py: two image augmentations + caption tokenization
-- models/image_encoder.py: image backbone + projection
-- models/text_encoder.py: DistilBERT + projection
+- datasets/coco_dataset.py: image views + caption tokenization
+- models/image_encoder.py: image encoder + projection
+- models/text_encoder.py: text encoder + projection
 - losses/simclr_loss.py: NT-Xent loss
 - losses/clip_loss.py: CLIP-style symmetric contrastive loss
 - train.py: training loop and checkpointing
-- evaluate.py: Recall@K evaluation
+- evaluate.py: robust retrieval evaluation
+- retrieve.py: CLI retrieval (text/image query)
+- retrieve_ui.py: desktop retrieval UI
+```bash
+python retrieve.py --config collab.config.yaml --checkpoint checkpoints/best.pt --image_dir data/coco/val2017 --query_text "an athlete playing tennis" --top_k 20
+```
+
+Image query:
+
+```bash
+python retrieve.py --config collab.config.yaml --checkpoint checkpoints/best.pt --image_dir data/coco/val2017 --query_image data/coco/val2017/000000033368.jpg --top_k 20
+```
+
+Use --rebuild_cache when you change image_dir contents or checkpoint and want to force refresh.
+
+## 8. Retrieve with UI
+
+```bash
+python retrieve_ui.py
+```
+
+In the UI:
+
+1. Click Load Index.
+2. Choose Text or Image Path mode.
+3. Enter query and click Search.
+4. Scroll through ranked image cards.
+
+## 9. Quick Smoke Test
+
+For a fast sanity run, lower in config temporarily:
+
+- training.epochs: 1
+- data.batch_size: 8 or 16
+- data.num_workers: 0
+
+Then run train -> evaluate -> retrieve.
+
+## Main Scripts
+
+- train.py: training loop and checkpointing
+- evaluate.py: robust retrieval evaluation with verdict and baselines
+- retrieve.py: CLI retrieval against an image folder
+- retrieve_ui.py: GUI retrieval viewer
+- data/preprocess.py: COCO pair generation

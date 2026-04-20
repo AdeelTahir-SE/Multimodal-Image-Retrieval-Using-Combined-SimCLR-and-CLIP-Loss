@@ -2,3 +2,4 @@
 coco
 checkpoints
 .cache
+_pycache_
