@@ -92,6 +92,8 @@ def encode_gallery(
 ) -> Tuple[torch.Tensor, List[str]]:
 	dataset = FolderImageDataset(image_paths)
 	loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+	total_images = len(dataset)
+	processed = 0
 
 	image_encoder.eval()
 	embeddings: List[torch.Tensor] = []
@@ -102,6 +104,14 @@ def encode_gallery(
 		batch_embed = F.normalize(image_encoder(batch_images), dim=1)
 		embeddings.append(batch_embed.cpu())
 		paths.extend(batch_paths)
+		processed += len(batch_paths)
+		progress = processed / total_images
+		bar_width = 30
+		filled = int(bar_width * progress)
+		bar = "=" * filled + "." * (bar_width - filled)
+		print(f"\rIndexing images: [{bar}] {processed}/{total_images}", end="", flush=True)
+
+	print()
 
 	return torch.cat(embeddings, dim=0), paths
 

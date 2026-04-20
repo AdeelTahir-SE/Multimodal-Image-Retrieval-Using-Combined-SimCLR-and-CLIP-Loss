@@ -5,6 +5,7 @@ mkdir -p data/coco
 cd data/coco
 
 wget -c http://images.cocodataset.org/zips/train2017.zip
+wget -c http://images.cocodataset.org/zips/val2017.zip
 wget -c http://images.cocodataset.org/annotations/annotations_trainval2017.zip
 
 extract_zip() {
@@ -18,6 +19,7 @@ extract_zip() {
 }
 
 extract_zip train2017.zip
+extract_zip val2017.zip
 extract_zip annotations_trainval2017.zip
 
-echo "MS-COCO 2017 train images and annotations downloaded to data/coco"
+echo "MS-COCO 2017 train/val images and annotations downloaded to data/coco"
