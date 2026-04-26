@@ -1,11 +1,41 @@
+"""
+evaluate.py  –  Semantic evaluation of the image-retrieval model on COCO val2017.
+
+Metrics computed
+----------------
+1. Average CLIP Score @ K   – cosine similarity between text query and
+                               retrieved images using a *frozen* openai/clip-vit-base-patch32.
+2. Semantic NDCG @ K        – NDCG with graded relevance derived from
+                               CLIP image-image similarity to the ground-truth image.
+3. Soft Recall @ K          – fraction of queries where ≥1 retrieved image
+                               has CLIP image similarity ≥ epsilon to the ground truth.
+4. Standard Recall/Precision/MRR @ K (exact-match baseline).
+
+Usage
+-----
+python evaluate.py \
+    --checkpoint checkpoints/best.pt \
+    --val_images  data/coco/val2017 \
+    --captions    data/coco/annotations/captions_val2017.json \
+    --config      config.yaml \
+    --top_k       5 \
+    --num_queries 1000 \
+    --batch_size  64 \
+    --out         checkpoints/eval_semantic.json
+"""
+
+from __future__ import annotations
+
 import argparse
 import json
+import math
+import os
 import random
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Tuple
 
 import faiss
+import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
@@ -14,499 +44,479 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from transformers import DistilBertTokenizer
 
+# ── project imports ──────────────────────────────────────────────────────────
 from models.image_encoder import ImageEncoder
 from models.text_encoder import TextEncoder
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+RETRIEVAL_TRANSFORM = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
 
-EVAL_IMAGE_TRANSFORM = transforms.Compose(
-    [
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ]
-)
+# CLIP evaluator uses its own normalisation
+CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_STD  = (0.26862954, 0.26130258, 0.27577711)
+CLIP_TRANSFORM = transforms.Compose([
+    transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(CLIP_MEAN, CLIP_STD),
+])
 
-# Random view for image->image query so evaluation is not trivially identical to gallery vectors.
-QUERY_IMAGE_AUGMENT = transforms.Compose(
-    [
-        transforms.RandomResizedCrop(224, scale=(0.5, 1.0)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ]
-)
-
-
-@dataclass
-class QuerySample:
-    query_type: str
-    query_text: str
-    query_image_path: str
-    target_image_path: str
-    top_results: List[str]
+VALID_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
-class GalleryImageDataset(Dataset):
-    def __init__(self, image_paths: Sequence[Path]):
-        self.image_paths = list(image_paths)
+# ─────────────────────────────────────────────────────────────────────────────
+# Tiny dataset helpers
+# ─────────────────────────────────────────────────────────────────────────────
+class PathImageDataset(Dataset):
+    """Return (tensor, path_str) for a list of image paths."""
+    def __init__(self, paths: List[Path], tfm):
+        self.paths = paths
+        self.tfm = tfm
 
-    def __len__(self) -> int:
-        return len(self.image_paths)
+    def __len__(self):
+        return len(self.paths)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        image_path = self.image_paths[idx]
-        image = Image.open(image_path).convert("RGB")
-        return EVAL_IMAGE_TRANSFORM(image), idx
+    def __getitem__(self, idx):
+        p = self.paths[idx]
+        img = Image.open(p).convert("RGB")
+        return self.tfm(img), str(p)
 
 
-def load_config(path: Path) -> Dict:
-    with path.open("r", encoding="utf-8") as f:
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility
+# ─────────────────────────────────────────────────────────────────────────────
+def _to_f32(t: torch.Tensor) -> np.ndarray:
+    return t.detach().cpu().contiguous().float().numpy()
+
+
+def load_config(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
-def to_numpy_float32(tensor: torch.Tensor):
-    return tensor.detach().cpu().contiguous().numpy().astype("float32", copy=False)
+def discover_images(folder: Path) -> List[Path]:
+    return sorted(p for p in folder.rglob("*")
+                  if p.is_file() and p.suffix.lower() in VALID_EXT)
 
 
-def image_id_from_name(name: str) -> int:
-    # COCO files are like 000000123456.jpg -> 123456
-    return int(Path(name).stem)
+def load_val_pairs(captions_json: Path, val_dir: Path,
+                   num_queries: int, seed: int = 42) -> List[Dict]:
+    """
+    Returns a list of dicts: {image_id, file_name, caption}
+    One caption per image (first caption encountered), sampled randomly.
+    """
+    with open(captions_json, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    id2file: Dict[int, str] = {img["id"]: img["file_name"] for img in data["images"]}
+    seen: set = set()
+    pairs: List[Dict] = []
+
+    for ann in data["annotations"]:
+        iid = ann["image_id"]
+        if iid in seen:
+            continue
+        fname = id2file.get(iid)
+        if fname is None:
+            continue
+        fpath = val_dir / fname
+        if not fpath.exists():
+            continue
+        pairs.append({"image_id": iid, "file_name": fname,
+                       "path": fpath, "caption": ann["caption"]})
+        seen.add(iid)
+
+    random.seed(seed)
+    random.shuffle(pairs)
+    return pairs[:num_queries]
 
 
-def load_coco_val(
-    image_dir: Path,
-    captions_json: Path,
-    max_text_queries: int,
-    max_image_queries: int,
-    seed: int,
-) -> Tuple[List[Path], Dict[int, int], List[Tuple[str, int]], List[int]]:
-    if not image_dir.exists() or not image_dir.is_dir():
-        raise FileNotFoundError(f"Image directory not found: {image_dir}")
-    if not captions_json.exists() or not captions_json.is_file():
-        raise FileNotFoundError(f"Captions json not found: {captions_json}")
-
-    with captions_json.open("r", encoding="utf-8") as f:
-        payload = json.load(f)
-
-    image_paths = sorted([p for p in image_dir.glob("*.jpg") if p.is_file()])
-    if not image_paths:
-        raise ValueError(f"No JPG images found in {image_dir}")
-
-    image_id_to_gallery_idx: Dict[int, int] = {}
-    for gallery_idx, path in enumerate(image_paths):
-        image_id_to_gallery_idx[image_id_from_name(path.name)] = gallery_idx
-
-    text_queries: List[Tuple[str, int]] = []
-    for ann in payload.get("annotations", []):
-        image_id = int(ann["image_id"])
-        if image_id in image_id_to_gallery_idx:
-            text_queries.append((ann["caption"], image_id_to_gallery_idx[image_id]))
-
-    image_query_indices: List[int] = list(range(len(image_paths)))
-
-    rng = random.Random(seed)
-    if max_text_queries > 0 and len(text_queries) > max_text_queries:
-        text_queries = rng.sample(text_queries, max_text_queries)
-    if max_image_queries > 0 and len(image_query_indices) > max_image_queries:
-        image_query_indices = rng.sample(image_query_indices, max_image_queries)
-
-    return image_paths, image_id_to_gallery_idx, text_queries, image_query_indices
-
-
-@torch.no_grad()
-def encode_gallery(
-    image_encoder: ImageEncoder,
-    image_paths: Sequence[Path],
-    batch_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    image_encoder.eval()
-    dataset = GalleryImageDataset(image_paths)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-
-    all_embeddings: List[torch.Tensor] = []
-    total = len(dataset)
-    done = 0
-    for batch_images, _ in loader:
-        batch_images = batch_images.to(device)
-        embed = F.normalize(image_encoder(batch_images), dim=1)
-        all_embeddings.append(embed.cpu())
-        done += batch_images.size(0)
-        print(f"\rEncoding gallery: {done}/{total}", end="", flush=True)
-    print()
-
-    return torch.cat(all_embeddings, dim=0)
-
-
-@torch.no_grad()
-def encode_text_queries(
-    text_encoder: TextEncoder,
-    tokenizer: DistilBertTokenizer,
-    queries: Sequence[str],
-    max_length: int,
-    batch_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    text_encoder.eval()
-    all_embeddings: List[torch.Tensor] = []
-
-    for start in range(0, len(queries), batch_size):
-        batch_queries = queries[start : start + batch_size]
-        tok = tokenizer(
-            list(batch_queries),
-            padding="max_length",
-            truncation=True,
-            max_length=max_length,
-            return_tensors="pt",
-        )
-        input_ids = tok["input_ids"].to(device)
-        attention_mask = tok["attention_mask"].to(device)
-        embed = F.normalize(text_encoder(input_ids, attention_mask), dim=1)
-        all_embeddings.append(embed.cpu())
-
-    return torch.cat(all_embeddings, dim=0)
-
-
-@torch.no_grad()
-def encode_image_queries(
-    image_encoder: ImageEncoder,
-    image_paths: Sequence[Path],
-    gallery_indices: Sequence[int],
-    batch_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    image_encoder.eval()
-    query_tensors: List[torch.Tensor] = []
-
-    for idx in gallery_indices:
-        image = Image.open(image_paths[idx]).convert("RGB")
-        query_tensors.append(QUERY_IMAGE_AUGMENT(image))
-
-    all_embeddings: List[torch.Tensor] = []
-    for start in range(0, len(query_tensors), batch_size):
-        batch = torch.stack(query_tensors[start : start + batch_size], dim=0).to(device)
-        embed = F.normalize(image_encoder(batch), dim=1)
-        all_embeddings.append(embed.cpu())
-
-    return torch.cat(all_embeddings, dim=0)
-
-
-def build_faiss_index(embeddings: torch.Tensor) -> faiss.Index:
-    vecs = to_numpy_float32(embeddings)
-    faiss.normalize_L2(vecs)
-    index = faiss.IndexFlatIP(vecs.shape[1])
-    index.add(vecs)
-    return index
-
-
-def compute_ranks(
-    query_embeddings: torch.Tensor,
-    target_gallery_indices: Sequence[int],
-    gallery_index: faiss.Index,
-    max_k: int,
-) -> List[int]:
-    q = to_numpy_float32(query_embeddings)
-    faiss.normalize_L2(q)
-
-    dists, indices = gallery_index.search(q, min(max_k, gallery_index.ntotal))
-    _ = dists
-
-    ranks: List[int] = []
-    for row, target_idx in enumerate(target_gallery_indices):
-        retrieved = indices[row].tolist()
-        if target_idx in retrieved:
-            ranks.append(retrieved.index(target_idx) + 1)
-        else:
-            ranks.append(gallery_index.ntotal + 1)
-    return ranks
-
-
-def metrics_from_ranks(ranks: Sequence[int], k_values: Sequence[int], gallery_size: int) -> Dict[str, float]:
-    n = len(ranks)
-    if n == 0:
-        return {}
-
-    out: Dict[str, float] = {}
-    for k in k_values:
-        recall = sum(1 for r in ranks if r <= k) / n
-        precision = sum((1.0 / k) for r in ranks if r <= k) / n
-        out[f"R@{k}"] = recall
-        out[f"P@{k}"] = precision
-
-    out["MRR"] = sum((1.0 / r) if r <= gallery_size else 0.0 for r in ranks) / n
-    out["mAP"] = out["MRR"]  # Single ground-truth target per query in this setup.
-    return out
-
-
-def pretty_metrics(title: str, metrics: Dict[str, float], k_values: Sequence[int]) -> str:
-    lines = [f"\n{title}"]
-    for k in k_values:
-        lines.append(f"  R@{k}: {metrics[f'R@{k}']:.4f}")
-    lines.append(f"  MRR : {metrics['MRR']:.4f}")
-    lines.append(f"  mAP : {metrics['mAP']:.4f}")
-    for k in k_values:
-        lines.append(f"  P@{k}: {metrics[f'P@{k}']:.4f}")
-    return "\n".join(lines)
-
-
-def collect_samples_text_to_image(
-    query_texts: Sequence[str],
-    target_indices: Sequence[int],
-    gallery_paths: Sequence[Path],
-    query_embeddings: torch.Tensor,
-    gallery_index: faiss.Index,
-    num_samples: int,
-    k: int,
-    seed: int,
-) -> List[QuerySample]:
-    if num_samples <= 0 or len(query_texts) == 0:
-        return []
-
-    rng = random.Random(seed)
-    picked = rng.sample(range(len(query_texts)), min(num_samples, len(query_texts)))
-
-    q = to_numpy_float32(query_embeddings[picked])
-    faiss.normalize_L2(q)
-    _, indices = gallery_index.search(q, min(k, gallery_index.ntotal))
-
-    samples: List[QuerySample] = []
-    for row, q_idx in enumerate(picked):
-        target_idx = target_indices[q_idx]
-        top_results = [str(gallery_paths[i]) for i in indices[row].tolist()]
-        samples.append(
-            QuerySample(
-                query_type="text_to_image",
-                query_text=query_texts[q_idx],
-                query_image_path="",
-                target_image_path=str(gallery_paths[target_idx]),
-                top_results=top_results,
-            )
-        )
-    return samples
-
-
-def collect_samples_image_to_image(
-    query_gallery_indices: Sequence[int],
-    gallery_paths: Sequence[Path],
-    query_embeddings: torch.Tensor,
-    gallery_index: faiss.Index,
-    num_samples: int,
-    k: int,
-    seed: int,
-) -> List[QuerySample]:
-    if num_samples <= 0 or len(query_gallery_indices) == 0:
-        return []
-
-    rng = random.Random(seed + 101)
-    picked = rng.sample(range(len(query_gallery_indices)), min(num_samples, len(query_gallery_indices)))
-
-    q = to_numpy_float32(query_embeddings[picked])
-    faiss.normalize_L2(q)
-    _, indices = gallery_index.search(q, min(k, gallery_index.ntotal))
-
-    samples: List[QuerySample] = []
-    for row, local_idx in enumerate(picked):
-        gallery_idx = query_gallery_indices[local_idx]
-        top_results = [str(gallery_paths[i]) for i in indices[row].tolist()]
-        samples.append(
-            QuerySample(
-                query_type="image_to_image",
-                query_text="",
-                query_image_path=str(gallery_paths[gallery_idx]),
-                target_image_path=str(gallery_paths[gallery_idx]),
-                top_results=top_results,
-            )
-        )
-    return samples
-
-
-def print_samples(samples: Sequence[QuerySample], title: str) -> None:
-    if not samples:
-        return
-
-    print(f"\n{title}")
-    for i, sample in enumerate(samples, start=1):
-        print(f"\nSample {i} [{sample.query_type}]")
-        if sample.query_text:
-            print(f"  Query Text   : {sample.query_text}")
-        if sample.query_image_path:
-            print(f"  Query Image  : {sample.query_image_path}")
-        print(f"  Target Image : {sample.target_image_path}")
-        print("  Retrieved:")
-        for rank, path in enumerate(sample.top_results, start=1):
-            print(f"    {rank:>2}. {path}")
-
-
-def save_json_report(
-    out_path: Path,
-    text_metrics: Dict[str, float],
-    image_metrics: Dict[str, float],
-    text_samples: Sequence[QuerySample],
-    image_samples: Sequence[QuerySample],
-) -> None:
-    payload = {
-        "text_to_image": text_metrics,
-        "image_to_image": image_metrics,
-        "samples": {
-            "text_to_image": [sample.__dict__ for sample in text_samples],
-            "image_to_image": [sample.__dict__ for sample in image_samples],
-        },
-    }
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate retrieval model on COCO val2017")
-    parser.add_argument("--config", default="config.yaml", help="Path to config yaml")
-    parser.add_argument("--checkpoint", default="checkpoints/best.pt", help="Path to model checkpoint")
-    parser.add_argument("--image_dir", default="data/coco/val2017", help="COCO val image directory")
-    parser.add_argument(
-        "--captions_json",
-        default="data/coco/annotations/captions_val2017.json",
-        help="COCO val captions annotations json",
-    )
-    parser.add_argument("--k", type=int, nargs="+", default=[1, 5, 10], help="K values for Recall@K and Precision@K")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for embedding")
-    parser.add_argument("--max_text_queries", type=int, default=0, help="Limit text queries (0 means all)")
-    parser.add_argument("--max_image_queries", type=int, default=0, help="Limit image queries (0 means all)")
-    parser.add_argument("--num_samples", type=int, default=5, help="How many sample queries to print")
-    parser.add_argument("--sample_top_k", type=int, default=10, help="Top-K to print for each sample query")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--save_json", default="", help="Optional path to save metrics/samples json")
-    args = parser.parse_args()
-
-    k_values = sorted(set(args.k))
-    if any(k <= 0 for k in k_values):
-        raise ValueError("All k values must be positive integers")
-
-    cfg = load_config(Path(args.config))
-    checkpoint_path = Path(args.checkpoint)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-    requested_device = cfg.get("training", {}).get("device", "cpu")
-    device = torch.device("cuda" if requested_device == "cuda" and torch.cuda.is_available() else "cpu")
-
-    print(f"Device: {device}")
-    print("Loading model...")
-
-    image_encoder = ImageEncoder(
+# ─────────────────────────────────────────────────────────────────────────────
+# Model loading
+# ─────────────────────────────────────────────────────────────────────────────
+def load_retrieval_model(checkpoint: Path, cfg: dict, device: torch.device):
+    img_enc = ImageEncoder(
         embedding_dim=cfg["model"]["embedding_dim"],
         backbone_name=cfg["model"]["image_backbone"],
         use_pretrained=cfg["model"].get("image_pretrained", False),
     ).to(device)
-    text_encoder = TextEncoder(
+    txt_enc = TextEncoder(
         embedding_dim=cfg["model"]["embedding_dim"],
         model_name=cfg["model"]["text_backbone"],
         use_pretrained=cfg["model"].get("text_pretrained", False),
     ).to(device)
+    payload = torch.load(checkpoint, map_location=device)
+    img_enc.load_state_dict(payload["image_encoder"])
+    txt_enc.load_state_dict(payload["text_encoder"])
+    img_enc.eval()
+    txt_enc.eval()
+    return img_enc, txt_enc
 
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    image_encoder.load_state_dict(ckpt["image_encoder"])
-    text_encoder.load_state_dict(ckpt["text_encoder"])
-    image_encoder.eval()
-    text_encoder.eval()
 
-    print("Loading COCO val metadata...")
-    gallery_paths, _, text_queries, image_query_indices = load_coco_val(
-        image_dir=Path(args.image_dir),
-        captions_json=Path(args.captions_json),
-        max_text_queries=args.max_text_queries,
-        max_image_queries=args.max_image_queries,
-        seed=args.seed,
-    )
+def load_clip_evaluator(device: torch.device):
+    """Load a frozen OpenAI CLIP (ViT-B/32) as the evaluator."""
+    try:
+        import clip  # openai/clip
+        model, _ = clip.load("ViT-B/32", device=device)
+        model.eval()
+        print("[Evaluator] Loaded openai/clip ViT-B/32 via `clip` package.")
+        return model, "openai_clip"
+    except ImportError:
+        pass
 
-    print(f"Gallery size: {len(gallery_paths)}")
-    print(f"Text queries: {len(text_queries)}")
-    print(f"Image queries: {len(image_query_indices)}")
-
-    print("Building gallery embeddings + FAISS index...")
-    gallery_embeddings = encode_gallery(
-        image_encoder=image_encoder,
-        image_paths=gallery_paths,
-        batch_size=args.batch_size,
-        device=device,
-    )
-    gallery_index = build_faiss_index(gallery_embeddings)
-
-    max_search_k = max(max(k_values), args.sample_top_k)
-
-    print("Evaluating text -> image...")
-    tokenizer = DistilBertTokenizer.from_pretrained(cfg["model"]["text_backbone"])
-    query_texts = [t for t, _ in text_queries]
-    text_targets = [idx for _, idx in text_queries]
-    text_query_embeddings = encode_text_queries(
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
-        queries=query_texts,
-        max_length=cfg.get("data", {}).get("max_length", 77),
-        batch_size=args.batch_size,
-        device=device,
-    )
-    text_ranks = compute_ranks(
-        query_embeddings=text_query_embeddings,
-        target_gallery_indices=text_targets,
-        gallery_index=gallery_index,
-        max_k=max_search_k,
-    )
-    text_metrics = metrics_from_ranks(text_ranks, k_values, gallery_index.ntotal)
-
-    print("Evaluating image -> image...")
-    image_query_embeddings = encode_image_queries(
-        image_encoder=image_encoder,
-        image_paths=gallery_paths,
-        gallery_indices=image_query_indices,
-        batch_size=args.batch_size,
-        device=device,
-    )
-    image_ranks = compute_ranks(
-        query_embeddings=image_query_embeddings,
-        target_gallery_indices=image_query_indices,
-        gallery_index=gallery_index,
-        max_k=max_search_k,
-    )
-    image_metrics = metrics_from_ranks(image_ranks, k_values, gallery_index.ntotal)
-
-    print(pretty_metrics("Text -> Image", text_metrics, k_values))
-    print(pretty_metrics("Image -> Image", image_metrics, k_values))
-
-    text_samples = collect_samples_text_to_image(
-        query_texts=query_texts,
-        target_indices=text_targets,
-        gallery_paths=gallery_paths,
-        query_embeddings=text_query_embeddings,
-        gallery_index=gallery_index,
-        num_samples=args.num_samples,
-        k=args.sample_top_k,
-        seed=args.seed,
-    )
-    image_samples = collect_samples_image_to_image(
-        query_gallery_indices=image_query_indices,
-        gallery_paths=gallery_paths,
-        query_embeddings=image_query_embeddings,
-        gallery_index=gallery_index,
-        num_samples=args.num_samples,
-        k=args.sample_top_k,
-        seed=args.seed,
-    )
-
-    print_samples(text_samples, "Manual Check Samples: Text -> Image")
-    print_samples(image_samples, "Manual Check Samples: Image -> Image")
-
-    if args.save_json:
-        out_path = Path(args.save_json)
-        save_json_report(
-            out_path=out_path,
-            text_metrics=text_metrics,
-            image_metrics=image_metrics,
-            text_samples=text_samples,
-            image_samples=image_samples,
+    try:
+        from transformers import CLIPModel, CLIPProcessor
+        model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        model.eval()
+        print("[Evaluator] Loaded openai/clip-vit-base-patch32 via HuggingFace.")
+        return (model, processor), "hf_clip"
+    except Exception as e:
+        raise RuntimeError(
+            "Could not load CLIP evaluator. Install either `clip` (pip install git+https://github.com/openai/CLIP.git) "
+            "or `transformers` with `openai/clip-vit-base-patch32`.\n" + str(e)
         )
-        print(f"\nSaved report: {out_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FAISS gallery builder
+# ─────────────────────────────────────────────────────────────────────────────
+@torch.no_grad()
+def build_faiss_index(
+    img_enc: ImageEncoder,
+    image_paths: List[Path],
+    batch_size: int,
+    device: torch.device,
+    cache_index: Path | None = None,
+    cache_meta: Path | None = None,
+) -> Tuple[faiss.Index, List[str]]:
+    """Encode all val images and return a FAISS inner-product index."""
+    # Try loading from cache
+    if cache_index and cache_meta and cache_index.exists() and cache_meta.exists():
+        print(f"[FAISS] Loading cached index from {cache_index}")
+        index = faiss.read_index(str(cache_index))
+        with open(cache_meta, "r", encoding="utf-8") as f:
+            paths = json.load(f)["paths"]
+        return index, paths
+
+    print(f"[FAISS] Encoding {len(image_paths)} images …")
+    dataset = PathImageDataset(image_paths, RETRIEVAL_TRANSFORM)
+    loader  = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    all_embs: List[np.ndarray] = []
+    all_paths: List[str] = []
+    img_enc.eval()
+
+    for i, (imgs, paths) in enumerate(loader):
+        imgs = imgs.to(device)
+        emb  = F.normalize(img_enc(imgs), dim=1)
+        all_embs.append(_to_f32(emb))
+        all_paths.extend(paths)
+        if (i + 1) % 20 == 0:
+            print(f"  {len(all_paths)}/{len(image_paths)} images encoded", end="\r")
+
+    print(f"  {len(all_paths)}/{len(image_paths)} images encoded")
+
+    gallery = np.vstack(all_embs).astype("float32")
+    faiss.normalize_L2(gallery)
+    index = faiss.IndexFlatIP(gallery.shape[1])
+    index.add(gallery)
+
+    if cache_index and cache_meta:
+        cache_index.parent.mkdir(parents=True, exist_ok=True)
+        faiss.write_index(index, str(cache_index))
+        with open(cache_meta, "w", encoding="utf-8") as f:
+            json.dump({"paths": all_paths}, f, indent=2)
+        print(f"[FAISS] Index saved → {cache_index}")
+
+    return index, all_paths
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLIP evaluator helpers
+# ─────────────────────────────────────────────────────────────────────────────
+@torch.no_grad()
+def clip_image_embed(image_paths: List[Path], clip_pkg, clip_type: str,
+                     device: torch.device) -> torch.Tensor:
+    """Return L2-normalised CLIP image embeddings, shape (N, D)."""
+    if clip_type == "openai_clip":
+        import clip
+        tensors = torch.stack([
+            CLIP_TRANSFORM(Image.open(p).convert("RGB")) for p in image_paths
+        ]).to(device)
+        feats = clip_pkg.encode_image(tensors).float()
+    else:
+        model, processor = clip_pkg
+        images = [Image.open(p).convert("RGB") for p in image_paths]
+        inputs = processor(images=images, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        # Use vision_model + visual_projection directly to always get a tensor
+        vision_out = model.vision_model(**inputs)
+        pooled = vision_out.pooler_output  # (N, hidden)
+        feats = model.visual_projection(pooled).float()
+    return F.normalize(feats, dim=1)
+
+
+@torch.no_grad()
+def clip_text_embed(texts: List[str], clip_pkg, clip_type: str,
+                    device: torch.device) -> torch.Tensor:
+    """Return L2-normalised CLIP text embeddings, shape (N, D)."""
+    if clip_type == "openai_clip":
+        import clip
+        tokens = clip.tokenize(texts, truncate=True).to(device)
+        feats = clip_pkg.encode_text(tokens).float()
+    else:
+        model, processor = clip_pkg
+        inputs = processor(text=texts, return_tensors="pt", padding=True, truncation=True)
+        # Keep only text-relevant keys to avoid unexpected-argument errors
+        text_keys = {"input_ids", "attention_mask"}
+        inputs = {k: v.to(device) for k, v in inputs.items() if k in text_keys}
+        # Use text_model + text_projection directly to always get a plain tensor
+        text_out = model.text_model(**inputs)
+        pooled = text_out.pooler_output  # (N, hidden)
+        feats = model.text_projection(pooled).float()
+    return F.normalize(feats, dim=1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metric helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def ndcg_at_k(relevances: List[float], k: int) -> float:
+    """Compute NDCG@K given a list of graded relevance scores (in rank order)."""
+    top = relevances[:k]
+    dcg  = sum(rel / math.log2(rank + 2) for rank, rel in enumerate(top))
+    ideal = sorted(relevances, reverse=True)[:k]
+    idcg = sum(rel / math.log2(rank + 2) for rank, rel in enumerate(ideal))
+    return dcg / idcg if idcg > 0 else 0.0
+
+
+def mrr_at_k(hit_ranks: List[int | None], k: int) -> float:
+    """Mean Reciprocal Rank: hit_ranks contains the 1-based rank of the hit, or None."""
+    rrs = []
+    for r in hit_ranks:
+        if r is not None and r <= k:
+            rrs.append(1.0 / r)
+        else:
+            rrs.append(0.0)
+    return float(np.mean(rrs)) if rrs else 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main evaluation loop
+# ─────────────────────────────────────────────────────────────────────────────
+@torch.no_grad()
+def evaluate(args):
+    random.seed(42)
+    cfg    = load_config(args.config)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[Device] {device}")
+
+    # ── 1. Load retrieval model ──────────────────────────────────────────────
+    print("[Model] Loading retrieval model from", args.checkpoint)
+    checkpoint = Path(args.checkpoint)
+    img_enc, txt_enc = load_retrieval_model(checkpoint, cfg, device)
+    tokenizer = DistilBertTokenizer.from_pretrained(cfg["model"]["text_backbone"])
+    max_len   = cfg["data"].get("max_length", 77)
+
+    # ── 2. Load CLIP evaluator ───────────────────────────────────────────────
+    print("[Evaluator] Loading frozen CLIP …")
+    clip_pkg, clip_type = load_clip_evaluator(device)
+
+    # ── 3. Prepare val pairs ─────────────────────────────────────────────────
+    val_dir      = Path(args.val_images)
+    captions_ann = Path(args.captions)
+    print(f"[Data] Loading captions from {captions_ann}")
+    pairs = load_val_pairs(captions_ann, val_dir, args.num_queries)
+    print(f"[Data] {len(pairs)} query pairs selected")
+
+    # ── 4. Build FAISS gallery from ALL val images ───────────────────────────
+    all_val_images = discover_images(val_dir)
+    print(f"[Gallery] {len(all_val_images)} val images found")
+
+    cache_dir   = Path(args.cache_dir)
+    cache_index = cache_dir / "val2017_gallery.index"
+    cache_meta  = cache_dir / "val2017_gallery.json"
+    gallery_index, gallery_paths = build_faiss_index(
+        img_enc, all_val_images, args.batch_size, device, cache_index, cache_meta
+    )
+    path2idx = {p: i for i, p in enumerate(gallery_paths)}
+
+    # ── 5. Evaluation ────────────────────────────────────────────────────────
+    K = args.top_k
+    eps = args.soft_recall_eps
+
+    # accumulators
+    clip_scores_at_k:   List[float] = []   # Metric 1
+    ndcg_at_k_scores:   List[float] = []   # Metric 2
+    soft_recall_hits:   List[float] = []   # Metric 3
+    exact_recall_at_k:  List[float] = []   # Metric 4 (standard)
+    exact_precision_at_k: List[float] = []
+    mrr_ranks:          List[int | None] = []
+
+    print(f"\n[Eval] Running over {len(pairs)} queries (top_k={K}) …\n")
+
+    # Process in small CLIP batches to avoid OOM
+    CLIP_BATCH = 16
+
+    for qi, pair in enumerate(pairs):
+        caption   = pair["caption"]
+        gt_path   = str(pair["path"])
+        gt_path_p = Path(gt_path)
+
+        # ── Text → FAISS retrieval ──
+        tok = tokenizer(
+            caption, padding="max_length", truncation=True,
+            max_length=max_len, return_tensors="pt"
+        )
+        input_ids = tok["input_ids"].to(device)
+        attn_mask = tok["attention_mask"].to(device)
+        txt_emb   = F.normalize(txt_enc(input_ids, attn_mask), dim=1)
+        q_np      = _to_f32(txt_emb).reshape(1, -1)
+        faiss.normalize_L2(q_np)
+        _, topk_idxs = gallery_index.search(q_np, min(K, gallery_index.ntotal))
+        topk_idxs = topk_idxs[0].tolist()
+
+        retrieved_paths = [Path(gallery_paths[i]) for i in topk_idxs]
+
+        # ── METRIC 4: Standard Exact Recall/Precision/MRR ──
+        hit_rank = None
+        exact_hits = 0
+        for rank, rp in enumerate(retrieved_paths, 1):
+            if str(rp) == gt_path or rp.name == gt_path_p.name:
+                if hit_rank is None:
+                    hit_rank = rank
+                exact_hits += 1
+        exact_recall_at_k.append(1.0 if hit_rank is not None else 0.0)
+        exact_precision_at_k.append(exact_hits / K)
+        mrr_ranks.append(hit_rank)
+
+        # ── METRIC 1: Average CLIP Score @ K ──
+        # Cosine similarity between text and each retrieved image via frozen CLIP
+        txt_clip = clip_text_embed([caption], clip_pkg, clip_type, device)  # (1, D)
+        imgs_clip = clip_image_embed(retrieved_paths, clip_pkg, clip_type, device)  # (K, D)
+        sim_scores = (txt_clip @ imgs_clip.T).squeeze(0)  # (K,)
+        avg_clip_score = sim_scores.mean().item()
+        clip_scores_at_k.append(avg_clip_score)
+
+        # ── METRIC 2: Semantic NDCG @ K ──
+        # Relevance = CLIP image-image cosine similarity between retrieved and GT
+        gt_clip = clip_image_embed([gt_path_p], clip_pkg, clip_type, device)  # (1, D)
+        img_img_sim = (gt_clip @ imgs_clip.T).squeeze(0)  # (K,)
+        # Shift from [-1,1] → [0,1] for non-negative relevance
+        relevances = ((img_img_sim + 1.0) / 2.0).cpu().tolist()
+        ndcg_at_k_scores.append(ndcg_at_k(relevances, K))
+
+        # ── METRIC 3: Soft Recall @ K ──
+        # Hit if any retrieved image is within eps cosine similarity of GT
+        max_sim = img_img_sim.max().item()
+        # Convert eps (threshold on [0,1] scale) back: sim in original [-1,1] scale
+        # eps is on [0,1] scale after the shift, so threshold = 2*eps - 1
+        threshold = 2.0 * eps - 1.0
+        soft_recall_hits.append(1.0 if max_sim >= threshold else 0.0)
+
+        if (qi + 1) % 50 == 0 or (qi + 1) == len(pairs):
+            print(f"  [{qi+1:4d}/{len(pairs)}] "
+                  f"CLIP@{K}={np.mean(clip_scores_at_k):.4f}  "
+                  f"NDCG@{K}={np.mean(ndcg_at_k_scores):.4f}  "
+                  f"SoftR@{K}={np.mean(soft_recall_hits):.4f}  "
+                  f"R@{K}={np.mean(exact_recall_at_k):.4f}")
+
+    # ── 6. Aggregate ─────────────────────────────────────────────────────────
+    results = {
+        "num_queries": len(pairs),
+        "top_k": K,
+        "soft_recall_epsilon": eps,
+        "metrics": {
+            f"avg_clip_score@{K}":  round(float(np.mean(clip_scores_at_k)),  6),
+            f"semantic_ndcg@{K}":   round(float(np.mean(ndcg_at_k_scores)),  6),
+            f"soft_recall@{K}":     round(float(np.mean(soft_recall_hits)),   6),
+            f"exact_recall@{K}":    round(float(np.mean(exact_recall_at_k)),  6),
+            f"exact_precision@{K}": round(float(np.mean(exact_precision_at_k)), 6),
+            f"mrr@{K}":             round(mrr_at_k(mrr_ranks, K),             6),
+        },
+        "per_k_breakdown": {},
+    }
+
+    # Per-K breakdown for K=1,3,5,10 (up to top_k)
+    for k_sub in [1, 3, 5, 10]:
+        if k_sub > K:
+            break
+        sub_recalls = []
+        sub_precs   = []
+        for pair, hit_rank in zip(pairs, mrr_ranks):
+            hit = hit_rank is not None and hit_rank <= k_sub
+            sub_recalls.append(1.0 if hit else 0.0)
+            sub_precs.append((1.0 / k_sub) if hit else 0.0)
+        results["per_k_breakdown"][f"R@{k_sub}"] = round(float(np.mean(sub_recalls)), 6)
+        results["per_k_breakdown"][f"P@{k_sub}"] = round(float(np.mean(sub_precs)),   6)
+
+    # ── 7. Print summary ─────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("  EVALUATION RESULTS  –  COCO val2017")
+    print("=" * 60)
+    print(f"  Queries evaluated : {results['num_queries']}")
+    print(f"  Top-K             : {K}")
+    print(f"  Soft-Recall ε     : {eps}  (on [0,1] cosine scale)")
+    print("-" * 60)
+    for name, val in results["metrics"].items():
+        print(f"  {name:<28s}: {val:.6f}")
+    print("-" * 60)
+    print("  Per-K breakdown:")
+    for name, val in results["per_k_breakdown"].items():
+        print(f"    {name:<10s}: {val:.6f}")
+    print("=" * 60)
+
+    # ── 8. Save JSON report ───────────────────────────────────────────────────
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n[Report] Saved → {out_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Semantic evaluation of image-retrieval model on COCO val2017"
+    )
+    p.add_argument("--checkpoint",  default="checkpoints/best.pt",
+                   help="Path to best.pt checkpoint")
+    p.add_argument("--config",      default="config.yaml",
+                   help="Path to config.yaml")
+    p.add_argument("--val_images",  default="data/coco/val2017",
+                   help="Directory of COCO val2017 images")
+    p.add_argument("--captions",    default="data/coco/annotations/captions_val2017.json",
+                   help="COCO captions_val2017.json annotation file")
+    p.add_argument("--top_k",       type=int, default=5,
+                   help="K for all @K metrics")
+    p.add_argument("--num_queries", type=int, default=1000,
+                   help="Number of val queries to evaluate (max ~5000)")
+    p.add_argument("--batch_size",  type=int, default=64,
+                   help="Batch size for gallery encoding")
+    p.add_argument("--cache_dir",   default=".cache/eval",
+                   help="Directory to cache FAISS index")
+    p.add_argument("--rebuild_cache", action="store_true",
+                   help="Force rebuild of FAISS gallery cache")
+    p.add_argument("--soft_recall_eps", type=float, default=0.80,
+                   help="Cosine similarity threshold (0-1 scale) for Soft Recall")
+    p.add_argument("--out",         default="checkpoints/eval_semantic.json",
+                   help="Output JSON report path")
+    p.add_argument("--seed",        type=int, default=42)
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    evaluate(args)

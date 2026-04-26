@@ -91,6 +91,12 @@ Use the rewritten evaluator for stronger diagnostics.
 python evaluate.py --config config.yaml --checkpoint checkpoints/best.pt --k 1 5 10 --eval_passes 3 --num_examples 5
 ```
 
+For manual labeling of retrieved results, launch the UI:
+
+```bash
+python evaluate_ui.py
+```
+
 What it reports:
 
 - Image->Image, Text->Image, and Image->Text metrics
