@@ -1,0 +1,46 @@
+write me an Architecuter.md file with proper many  diagrams eplain complete from traaining to evaluation
+Note that for training:
+!python data/preprocess.py --subset_size 2000 --output data/coco_pairs.json
+
+epochs=10
+subset_size=2000
+
+Epoch 1/10: 100% 62/62 [04:01<00:00,  3.89s/it, loss=1.1702, simclr=0.5643, clip=1.7762]
+Epoch 1: loss=1.4607, simclr=0.6779, clip=2.2435
+Epoch 2/10: 100% 62/62 [03:55<00:00,  3.80s/it, loss=1.1564, simclr=0.5185, clip=1.7943]
+Epoch 2: loss=0.8814, simclr=0.3818, clip=1.3809
+Epoch 3/10: 100% 62/62 [03:51<00:00,  3.73s/it, loss=0.7262, simclr=0.3067, clip=1.1456]
+Epoch 3: loss=0.7463, simclr=0.3459, clip=1.1467
+Epoch 4/10: 100% 62/62 [03:50<00:00,  3.72s/it, loss=0.4673, simclr=0.1452, clip=0.7895]
+Epoch 4: loss=0.6515, simclr=0.3175, clip=0.9855
+Epoch 5/10: 100% 62/62 [03:48<00:00,  3.68s/it, loss=0.4335, simclr=0.3379, clip=0.5292]
+Epoch 5: loss=0.5148, simclr=0.2621, clip=0.7674
+Epoch 6/10: 100% 62/62 [03:56<00:00,  3.82s/it, loss=0.5018, simclr=0.4732, clip=0.5303]
+Epoch 6: loss=0.4525, simclr=0.2661, clip=0.6388
+Epoch 7/10: 100% 62/62 [03:51<00:00,  3.74s/it, loss=0.4590, simclr=0.2599, clip=0.6580]
+Epoch 7: loss=0.4137, simclr=0.2384, clip=0.5891
+Epoch 8/10: 100% 62/62 [03:57<00:00,  3.83s/it, loss=0.4658, simclr=0.3922, clip=0.5394]
+Epoch 8: loss=0.4032, simclr=0.2529, clip=0.5536
+Epoch 9/10: 100% 62/62 [03:57<00:00,  3.84s/it, loss=0.2296, simclr=0.1456, clip=0.3136]
+Epoch 9: loss=0.3468, simclr=0.2093, clip=0.4843
+Epoch 10/10: 100% 62/62 [03:51<00:00,  3.73s/it, loss=0.2536, simclr=0.1934, clip=0.3138]
+Epoch 10: loss=0.3195, simclr=0.1998, clip=0.4393
+
+Now for text-to image retrieval:
+[  50/50] CLIP@5=0.2478  NDCG@5=0.9862  SoftR@5=0.8800  R@5=0.1000
+
+============================================================
+  EVALUATION RESULTS  –  COCO val2017
+============================================================
+  Queries evaluated : 50
+  Top-K             : 5
+  Soft-Recall ε     : 0.8  (on [0,1] cosine scale)
+------------------------------------------------------------
+  avg_clip_score@5            : 0.247808
+  semantic_ndcg@5             : 0.986168
+  soft_recall@5               : 0.880000
+  exact_recall@5              : 0.100000
+  exact_precision@5           : 0.020000
+  exact_recall@5              : 0.100000
+  exact_precision@5           : 0.020000
+  mrr@5                       : 0.045000
