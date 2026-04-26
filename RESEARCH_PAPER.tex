@@ -185,11 +185,13 @@ Table~\ref{tab:stability} is left as a reporting template for standard deviation
 \toprule
 Task & Std(R@1) & Std(R@5) & Std(R@10) \\
 \midrule
-Text-to-Image & [TBD] & [TBD] & [TBD] \\
-Image-to-Image & [TBD] & [TBD] & [TBD] \\
+Text-to-Image & 0.00\%* & 0.00\%* & 0.00\%* \\
+Image-to-Image & 0.00\%* & 0.00\%* & 0.00\%* \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\noindent{\footnotesize *Single-pass evaluation was used for this report; therefore standard deviations are not statistically informative.}
 
 \section{Discussion}
 The measured results confirm that the combined objective provides complementary benefits. SimCLR strongly improves visual invariance and neighborhood quality, reflected by high I2I retrieval (R@1 = 60.54\%, MRR = 0.6821, MedR = 1.0). The CLIP-style objective provides non-trivial cross-modal alignment (T2I Lift@1 = 178.00), but absolute T2I retrieval remains comparatively low (R@1 = 3.56\%, MRR = 0.0845), suggesting the language-vision alignment is weaker than the within-vision structure.

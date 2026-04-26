@@ -1,345 +1,511 @@
 import argparse
 import json
 import random
-import statistics
-from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
+import faiss
 import torch
 import torch.nn.functional as F
 import yaml
-from torch.utils.data import DataLoader
-from tqdm import tqdm
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from transformers import DistilBertTokenizer
 
-from datasets.coco_dataset import COCOPairDataset
 from models.image_encoder import ImageEncoder
 from models.text_encoder import TextEncoder
 
 
-def load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
+EVAL_IMAGE_TRANSFORM = transforms.Compose(
+    [
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ]
+)
+
+# Random view for image->image query so evaluation is not trivially identical to gallery vectors.
+QUERY_IMAGE_AUGMENT = transforms.Compose(
+    [
+        transforms.RandomResizedCrop(224, scale=(0.5, 1.0)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ]
+)
+
+
+@dataclass
+class QuerySample:
+    query_type: str
+    query_text: str
+    query_image_path: str
+    target_image_path: str
+    top_results: List[str]
+
+
+class GalleryImageDataset(Dataset):
+    def __init__(self, image_paths: Sequence[Path]):
+        self.image_paths = list(image_paths)
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        image_path = self.image_paths[idx]
+        image = Image.open(image_path).convert("RGB")
+        return EVAL_IMAGE_TRANSFORM(image), idx
+
+
+def load_config(path: Path) -> Dict:
+    with path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
-def load_pairs(pairs_json: str) -> List[dict]:
-    with open(pairs_json, "r", encoding="utf-8") as f:
-        pairs = json.load(f)
-    if not isinstance(pairs, list) or not pairs:
-        raise ValueError(f"pairs_json must contain a non-empty list: {pairs_json}")
-    return pairs
+def to_numpy_float32(tensor: torch.Tensor):
+    return tensor.detach().cpu().contiguous().numpy().astype("float32", copy=False)
 
 
-def build_positive_indices(pairs: Sequence[dict]) -> List[List[int]]:
-    image_to_indices: Dict[str, List[int]] = defaultdict(list)
-    for idx, item in enumerate(pairs):
-        image_to_indices[item["image_path"]].append(idx)
-    return [image_to_indices[item["image_path"]] for item in pairs]
+def image_id_from_name(name: str) -> int:
+    # COCO files are like 000000123456.jpg -> 123456
+    return int(Path(name).stem)
+
+
+def load_coco_val(
+    image_dir: Path,
+    captions_json: Path,
+    max_text_queries: int,
+    max_image_queries: int,
+    seed: int,
+) -> Tuple[List[Path], Dict[int, int], List[Tuple[str, int]], List[int]]:
+    if not image_dir.exists() or not image_dir.is_dir():
+        raise FileNotFoundError(f"Image directory not found: {image_dir}")
+    if not captions_json.exists() or not captions_json.is_file():
+        raise FileNotFoundError(f"Captions json not found: {captions_json}")
+
+    with captions_json.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    image_paths = sorted([p for p in image_dir.glob("*.jpg") if p.is_file()])
+    if not image_paths:
+        raise ValueError(f"No JPG images found in {image_dir}")
+
+    image_id_to_gallery_idx: Dict[int, int] = {}
+    for gallery_idx, path in enumerate(image_paths):
+        image_id_to_gallery_idx[image_id_from_name(path.name)] = gallery_idx
+
+    text_queries: List[Tuple[str, int]] = []
+    for ann in payload.get("annotations", []):
+        image_id = int(ann["image_id"])
+        if image_id in image_id_to_gallery_idx:
+            text_queries.append((ann["caption"], image_id_to_gallery_idx[image_id]))
+
+    image_query_indices: List[int] = list(range(len(image_paths)))
+
+    rng = random.Random(seed)
+    if max_text_queries > 0 and len(text_queries) > max_text_queries:
+        text_queries = rng.sample(text_queries, max_text_queries)
+    if max_image_queries > 0 and len(image_query_indices) > max_image_queries:
+        image_query_indices = rng.sample(image_query_indices, max_image_queries)
+
+    return image_paths, image_id_to_gallery_idx, text_queries, image_query_indices
 
 
 @torch.no_grad()
-def encode_embeddings(
+def encode_gallery(
     image_encoder: ImageEncoder,
-    text_encoder: TextEncoder,
-    dataloader: DataLoader,
+    image_paths: Sequence[Path],
+    batch_size: int,
     device: torch.device,
-    pass_id: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    image_query_embeds: List[torch.Tensor] = []
-    image_gallery_embeds: List[torch.Tensor] = []
-    text_embeds: List[torch.Tensor] = []
-
+) -> torch.Tensor:
     image_encoder.eval()
+    dataset = GalleryImageDataset(image_paths)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    all_embeddings: List[torch.Tensor] = []
+    total = len(dataset)
+    done = 0
+    for batch_images, _ in loader:
+        batch_images = batch_images.to(device)
+        embed = F.normalize(image_encoder(batch_images), dim=1)
+        all_embeddings.append(embed.cpu())
+        done += batch_images.size(0)
+        print(f"\rEncoding gallery: {done}/{total}", end="", flush=True)
+    print()
+
+    return torch.cat(all_embeddings, dim=0)
+
+
+@torch.no_grad()
+def encode_text_queries(
+    text_encoder: TextEncoder,
+    tokenizer: DistilBertTokenizer,
+    queries: Sequence[str],
+    max_length: int,
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
     text_encoder.eval()
+    all_embeddings: List[torch.Tensor] = []
 
-    for batch in tqdm(dataloader, desc=f"Encoding pass {pass_id}"):
-        images_q = batch["image_aug1"].to(device)
-        images_g = batch["image_aug2"].to(device)
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-
-        z_img_q = image_encoder(images_q)
-        z_img_g = image_encoder(images_g)
-        z_txt = text_encoder(input_ids, attention_mask)
-
-        image_query_embeds.append(F.normalize(z_img_q, dim=1).cpu())
-        image_gallery_embeds.append(F.normalize(z_img_g, dim=1).cpu())
-        text_embeds.append(F.normalize(z_txt, dim=1).cpu())
-
-    return (
-        torch.cat(image_query_embeds, dim=0),
-        torch.cat(image_gallery_embeds, dim=0),
-        torch.cat(text_embeds, dim=0),
-    )
-
-
-def random_hit_probability(num_gallery: int, num_positive: int, k: int) -> float:
-    if num_positive <= 0:
-        return 0.0
-    k = min(k, num_gallery)
-    miss_prob = 1.0
-    for i in range(k):
-        miss_prob *= (num_gallery - num_positive - i) / (num_gallery - i)
-    return 1.0 - miss_prob
-
-
-def retrieval_metrics(
-    similarity: torch.Tensor,
-    positives_per_query: Sequence[Sequence[int]],
-    ks: Iterable[int],
-) -> dict:
-    ks = sorted(set(int(k) for k in ks if int(k) > 0))
-    if not ks:
-        raise ValueError("At least one positive K is required")
-
-    num_queries, num_gallery = similarity.shape
-    max_k = min(max(ks), num_gallery)
-    topk = similarity.topk(max_k, dim=1).indices
-
-    hit_counts = {k: 0 for k in ks}
-    reciprocal_ranks: List[float] = []
-    ranks: List[int] = []
-    random_expected = {k: 0.0 for k in ks}
-
-    for q_idx, positive_indices in enumerate(positives_per_query):
-        pos_set = set(positive_indices)
-        if not pos_set:
-            continue
-
-        top_list = topk[q_idx].tolist()
-        for k in ks:
-            k_eff = min(k, len(top_list))
-            if any(idx in pos_set for idx in top_list[:k_eff]):
-                hit_counts[k] += 1
-            random_expected[k] += random_hit_probability(num_gallery, len(pos_set), k)
-
-        pos_tensor = torch.tensor(list(pos_set), dtype=torch.long)
-        row = similarity[q_idx]
-        best_positive_score = row[pos_tensor].max()
-        rank = int((row > best_positive_score).sum().item()) + 1
-        ranks.append(rank)
-        reciprocal_ranks.append(1.0 / rank)
-
-    denom = max(1, len(ranks))
-    metrics = {
-        "MRR": sum(reciprocal_ranks) / denom,
-        "MedR": float(statistics.median(ranks)) if ranks else float("inf"),
-        "MeanR": sum(ranks) / denom,
-    }
-    for k in ks:
-        metrics[f"R@{k}"] = hit_counts[k] / denom
-        metrics[f"RndR@{k}"] = random_expected[k] / denom
-        base = metrics[f"RndR@{k}"]
-        metrics[f"Lift@{k}"] = (metrics[f"R@{k}"] / base) if base > 0 else float("inf")
-    return metrics
-
-
-def print_metric_block(title: str, metrics: dict, ks: Sequence[int]) -> None:
-    print(title)
-    for k in ks:
-        print(
-            f"  R@{k}: {metrics[f'R@{k}'] * 100:.2f}% | "
-            f"Random~{metrics[f'RndR@{k}'] * 100:.2f}% | "
-            f"Lift x{metrics[f'Lift@{k}']:.2f}"
+    for start in range(0, len(queries), batch_size):
+        batch_queries = queries[start : start + batch_size]
+        tok = tokenizer(
+            list(batch_queries),
+            padding="max_length",
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
         )
-    print(f"  MRR: {metrics['MRR']:.4f}")
-    print(f"  MedR: {metrics['MedR']:.1f}")
-    print(f"  MeanR: {metrics['MeanR']:.2f}")
+        input_ids = tok["input_ids"].to(device)
+        attention_mask = tok["attention_mask"].to(device)
+        embed = F.normalize(text_encoder(input_ids, attention_mask), dim=1)
+        all_embeddings.append(embed.cpu())
+
+    return torch.cat(all_embeddings, dim=0)
 
 
-def summarize_quality(text_to_image_metrics: dict) -> str:
-    r1 = text_to_image_metrics.get("R@1", 0.0)
-    r5 = text_to_image_metrics.get("R@5", text_to_image_metrics.get("R@1", 0.0))
-    lift1 = text_to_image_metrics.get("Lift@1", 0.0)
+@torch.no_grad()
+def encode_image_queries(
+    image_encoder: ImageEncoder,
+    image_paths: Sequence[Path],
+    gallery_indices: Sequence[int],
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    image_encoder.eval()
+    query_tensors: List[torch.Tensor] = []
 
-    if r1 >= 0.25 and r5 >= 0.55 and lift1 >= 8.0:
-        return "Strong: model is retrieving relevant images reliably."
-    if r1 >= 0.12 and r5 >= 0.35 and lift1 >= 4.0:
-        return "Promising: model learned alignment, but still misses many exact matches."
-    if r1 >= 0.05 and r5 >= 0.20:
-        return "Weak to moderate: better than chance, but quality is not production-ready."
-    return "Poor: retrieval is close to random for strict top ranks."
+    for idx in gallery_indices:
+        image = Image.open(image_paths[idx]).convert("RGB")
+        query_tensors.append(QUERY_IMAGE_AUGMENT(image))
 
+    all_embeddings: List[torch.Tensor] = []
+    for start in range(0, len(query_tensors), batch_size):
+        batch = torch.stack(query_tensors[start : start + batch_size], dim=0).to(device)
+        embed = F.normalize(image_encoder(batch), dim=1)
+        all_embeddings.append(embed.cpu())
 
-def average_metric_dicts(metric_dicts: Sequence[dict]) -> dict:
-    keys = metric_dicts[0].keys()
-    result = {}
-    for key in keys:
-        values = [m[key] for m in metric_dicts]
-        result[key] = {
-            "mean": float(sum(values) / len(values)),
-            "std": float(statistics.pstdev(values)) if len(values) > 1 else 0.0,
-        }
-    return result
+    return torch.cat(all_embeddings, dim=0)
 
 
-def print_qualitative_examples(
-    pairs: Sequence[dict],
-    similarity: torch.Tensor,
-    top_k: int,
-    num_examples: int,
-) -> None:
-    if num_examples <= 0:
+def build_faiss_index(embeddings: torch.Tensor) -> faiss.Index:
+    vecs = to_numpy_float32(embeddings)
+    faiss.normalize_L2(vecs)
+    index = faiss.IndexFlatIP(vecs.shape[1])
+    index.add(vecs)
+    return index
+
+
+def compute_ranks(
+    query_embeddings: torch.Tensor,
+    target_gallery_indices: Sequence[int],
+    gallery_index: faiss.Index,
+    max_k: int,
+) -> List[int]:
+    q = to_numpy_float32(query_embeddings)
+    faiss.normalize_L2(q)
+
+    dists, indices = gallery_index.search(q, min(max_k, gallery_index.ntotal))
+    _ = dists
+
+    ranks: List[int] = []
+    for row, target_idx in enumerate(target_gallery_indices):
+        retrieved = indices[row].tolist()
+        if target_idx in retrieved:
+            ranks.append(retrieved.index(target_idx) + 1)
+        else:
+            ranks.append(gallery_index.ntotal + 1)
+    return ranks
+
+
+def metrics_from_ranks(ranks: Sequence[int], k_values: Sequence[int], gallery_size: int) -> Dict[str, float]:
+    n = len(ranks)
+    if n == 0:
+        return {}
+
+    out: Dict[str, float] = {}
+    for k in k_values:
+        recall = sum(1 for r in ranks if r <= k) / n
+        precision = sum((1.0 / k) for r in ranks if r <= k) / n
+        out[f"R@{k}"] = recall
+        out[f"P@{k}"] = precision
+
+    out["MRR"] = sum((1.0 / r) if r <= gallery_size else 0.0 for r in ranks) / n
+    out["mAP"] = out["MRR"]  # Single ground-truth target per query in this setup.
+    return out
+
+
+def pretty_metrics(title: str, metrics: Dict[str, float], k_values: Sequence[int]) -> str:
+    lines = [f"\n{title}"]
+    for k in k_values:
+        lines.append(f"  R@{k}: {metrics[f'R@{k}']:.4f}")
+    lines.append(f"  MRR : {metrics['MRR']:.4f}")
+    lines.append(f"  mAP : {metrics['mAP']:.4f}")
+    for k in k_values:
+        lines.append(f"  P@{k}: {metrics[f'P@{k}']:.4f}")
+    return "\n".join(lines)
+
+
+def collect_samples_text_to_image(
+    query_texts: Sequence[str],
+    target_indices: Sequence[int],
+    gallery_paths: Sequence[Path],
+    query_embeddings: torch.Tensor,
+    gallery_index: faiss.Index,
+    num_samples: int,
+    k: int,
+    seed: int,
+) -> List[QuerySample]:
+    if num_samples <= 0 or len(query_texts) == 0:
+        return []
+
+    rng = random.Random(seed)
+    picked = rng.sample(range(len(query_texts)), min(num_samples, len(query_texts)))
+
+    q = to_numpy_float32(query_embeddings[picked])
+    faiss.normalize_L2(q)
+    _, indices = gallery_index.search(q, min(k, gallery_index.ntotal))
+
+    samples: List[QuerySample] = []
+    for row, q_idx in enumerate(picked):
+        target_idx = target_indices[q_idx]
+        top_results = [str(gallery_paths[i]) for i in indices[row].tolist()]
+        samples.append(
+            QuerySample(
+                query_type="text_to_image",
+                query_text=query_texts[q_idx],
+                query_image_path="",
+                target_image_path=str(gallery_paths[target_idx]),
+                top_results=top_results,
+            )
+        )
+    return samples
+
+
+def collect_samples_image_to_image(
+    query_gallery_indices: Sequence[int],
+    gallery_paths: Sequence[Path],
+    query_embeddings: torch.Tensor,
+    gallery_index: faiss.Index,
+    num_samples: int,
+    k: int,
+    seed: int,
+) -> List[QuerySample]:
+    if num_samples <= 0 or len(query_gallery_indices) == 0:
+        return []
+
+    rng = random.Random(seed + 101)
+    picked = rng.sample(range(len(query_gallery_indices)), min(num_samples, len(query_gallery_indices)))
+
+    q = to_numpy_float32(query_embeddings[picked])
+    faiss.normalize_L2(q)
+    _, indices = gallery_index.search(q, min(k, gallery_index.ntotal))
+
+    samples: List[QuerySample] = []
+    for row, local_idx in enumerate(picked):
+        gallery_idx = query_gallery_indices[local_idx]
+        top_results = [str(gallery_paths[i]) for i in indices[row].tolist()]
+        samples.append(
+            QuerySample(
+                query_type="image_to_image",
+                query_text="",
+                query_image_path=str(gallery_paths[gallery_idx]),
+                target_image_path=str(gallery_paths[gallery_idx]),
+                top_results=top_results,
+            )
+        )
+    return samples
+
+
+def print_samples(samples: Sequence[QuerySample], title: str) -> None:
+    if not samples:
         return
-    print("\nQualitative text->image samples")
-    example_indices = random.sample(range(len(pairs)), min(num_examples, len(pairs)))
-    k_eff = min(top_k, similarity.size(1))
 
-    for rank_idx, idx in enumerate(example_indices, start=1):
-        top_idx = similarity[idx].topk(k_eff).indices.tolist()
-        query_caption = pairs[idx]["caption"]
-        gt_image = pairs[idx]["image_path"]
-        print(f"  [{rank_idx}] caption: {query_caption}")
-        print(f"      gt: {gt_image}")
-        for k, pred_i in enumerate(top_idx[:3], start=1):
-            pred_path = pairs[pred_i]["image_path"]
-            marker = "*" if pred_path == gt_image else " "
-            print(f"      {marker} top{k}: {pred_path}")
+    print(f"\n{title}")
+    for i, sample in enumerate(samples, start=1):
+        print(f"\nSample {i} [{sample.query_type}]")
+        if sample.query_text:
+            print(f"  Query Text   : {sample.query_text}")
+        if sample.query_image_path:
+            print(f"  Query Image  : {sample.query_image_path}")
+        print(f"  Target Image : {sample.target_image_path}")
+        print("  Retrieved:")
+        for rank, path in enumerate(sample.top_results, start=1):
+            print(f"    {rank:>2}. {path}")
+
+
+def save_json_report(
+    out_path: Path,
+    text_metrics: Dict[str, float],
+    image_metrics: Dict[str, float],
+    text_samples: Sequence[QuerySample],
+    image_samples: Sequence[QuerySample],
+) -> None:
+    payload = {
+        "text_to_image": text_metrics,
+        "image_to_image": image_metrics,
+        "samples": {
+            "text_to_image": [sample.__dict__ for sample in text_samples],
+            "image_to_image": [sample.__dict__ for sample in image_samples],
+        },
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate retrieval quality with robust diagnostics")
-    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
-    parser.add_argument("--checkpoint", required=True, help="Path to checkpoint file")
-    parser.add_argument("--k", nargs="+", type=int, default=[1, 5, 10], help="Recall cutoffs")
-    parser.add_argument("--batch_size", type=int, default=None, help="Override eval batch size")
+    parser = argparse.ArgumentParser(description="Evaluate retrieval model on COCO val2017")
+    parser.add_argument("--config", default="config.yaml", help="Path to config yaml")
+    parser.add_argument("--checkpoint", default="checkpoints/best.pt", help="Path to model checkpoint")
+    parser.add_argument("--image_dir", default="data/coco/val2017", help="COCO val image directory")
     parser.add_argument(
-        "--eval_passes",
-        type=int,
-        default=3,
-        help="Number of evaluation passes to average (helps with stochastic augmentations)",
+        "--captions_json",
+        default="data/coco/annotations/captions_val2017.json",
+        help="COCO val captions annotations json",
     )
+    parser.add_argument("--k", type=int, nargs="+", default=[1, 5, 10], help="K values for Recall@K and Precision@K")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for embedding")
+    parser.add_argument("--max_text_queries", type=int, default=0, help="Limit text queries (0 means all)")
+    parser.add_argument("--max_image_queries", type=int, default=0, help="Limit image queries (0 means all)")
+    parser.add_argument("--num_samples", type=int, default=5, help="How many sample queries to print")
+    parser.add_argument("--sample_top_k", type=int, default=10, help="Top-K to print for each sample query")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument(
-        "--num_examples",
-        type=int,
-        default=5,
-        help="How many qualitative text->image examples to print",
-    )
-    parser.add_argument("--save_json", type=str, default=None, help="Optional output JSON report path")
+    parser.add_argument("--save_json", default="", help="Optional path to save metrics/samples json")
     args = parser.parse_args()
 
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    k_values = sorted(set(args.k))
+    if any(k <= 0 for k in k_values):
+        raise ValueError("All k values must be positive integers")
 
-    cfg = load_config(args.config)
-    pairs = load_pairs(cfg["data"]["pairs_json"])
-    positives = build_positive_indices(pairs)
+    cfg = load_config(Path(args.config))
+    checkpoint_path = Path(args.checkpoint)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     requested_device = cfg.get("training", {}).get("device", "cpu")
     device = torch.device("cuda" if requested_device == "cuda" and torch.cuda.is_available() else "cpu")
+
     print(f"Device: {device}")
-    print(f"Pairs: {len(pairs)} from {cfg['data']['pairs_json']}")
-
-    dataset = COCOPairDataset(
-        pairs_json=cfg["data"]["pairs_json"],
-        max_length=cfg["data"].get("max_length", 77),
-        tokenizer_name=cfg["model"]["text_backbone"],
-        train=False,
-    )
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size or cfg["data"]["batch_size"],
-        shuffle=False,
-        num_workers=cfg["data"]["num_workers"],
-        pin_memory=torch.cuda.is_available(),
-    )
+    print("Loading model...")
 
     image_encoder = ImageEncoder(
         embedding_dim=cfg["model"]["embedding_dim"],
         backbone_name=cfg["model"]["image_backbone"],
         use_pretrained=cfg["model"].get("image_pretrained", False),
     ).to(device)
-
     text_encoder = TextEncoder(
         embedding_dim=cfg["model"]["embedding_dim"],
         model_name=cfg["model"]["text_backbone"],
         use_pretrained=cfg["model"].get("text_pretrained", False),
     ).to(device)
 
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    image_encoder.load_state_dict(checkpoint["image_encoder"])
-    text_encoder.load_state_dict(checkpoint["text_encoder"])
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    image_encoder.load_state_dict(ckpt["image_encoder"])
+    text_encoder.load_state_dict(ckpt["text_encoder"])
+    image_encoder.eval()
+    text_encoder.eval()
 
-    ks = sorted(set(k for k in args.k if k > 0))
-    if not ks:
-        raise ValueError("--k must contain at least one positive integer")
+    print("Loading COCO val metadata...")
+    gallery_paths, _, text_queries, image_query_indices = load_coco_val(
+        image_dir=Path(args.image_dir),
+        captions_json=Path(args.captions_json),
+        max_text_queries=args.max_text_queries,
+        max_image_queries=args.max_image_queries,
+        seed=args.seed,
+    )
 
-    i2i_runs: List[dict] = []
-    t2i_runs: List[dict] = []
-    i2t_runs: List[dict] = []
-    final_t2i_similarity = None
+    print(f"Gallery size: {len(gallery_paths)}")
+    print(f"Text queries: {len(text_queries)}")
+    print(f"Image queries: {len(image_query_indices)}")
 
-    for pass_id in range(1, max(1, args.eval_passes) + 1):
-        img_q_emb, img_g_emb, txt_emb = encode_embeddings(
-            image_encoder=image_encoder,
-            text_encoder=text_encoder,
-            dataloader=dataloader,
-            device=device,
-            pass_id=pass_id,
-        )
+    print("Building gallery embeddings + FAISS index...")
+    gallery_embeddings = encode_gallery(
+        image_encoder=image_encoder,
+        image_paths=gallery_paths,
+        batch_size=args.batch_size,
+        device=device,
+    )
+    gallery_index = build_faiss_index(gallery_embeddings)
 
-        sim_i2i = img_q_emb @ img_g_emb.t()
-        sim_t2i = txt_emb @ img_g_emb.t()
-        sim_i2t = img_q_emb @ txt_emb.t()
-        final_t2i_similarity = sim_t2i
+    max_search_k = max(max(k_values), args.sample_top_k)
 
-        i2i_runs.append(retrieval_metrics(sim_i2i, positives, ks))
-        t2i_runs.append(retrieval_metrics(sim_t2i, positives, ks))
-        i2t_runs.append(retrieval_metrics(sim_i2t, positives, ks))
+    print("Evaluating text -> image...")
+    tokenizer = DistilBertTokenizer.from_pretrained(cfg["model"]["text_backbone"])
+    query_texts = [t for t, _ in text_queries]
+    text_targets = [idx for _, idx in text_queries]
+    text_query_embeddings = encode_text_queries(
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        queries=query_texts,
+        max_length=cfg.get("data", {}).get("max_length", 77),
+        batch_size=args.batch_size,
+        device=device,
+    )
+    text_ranks = compute_ranks(
+        query_embeddings=text_query_embeddings,
+        target_gallery_indices=text_targets,
+        gallery_index=gallery_index,
+        max_k=max_search_k,
+    )
+    text_metrics = metrics_from_ranks(text_ranks, k_values, gallery_index.ntotal)
 
-    i2i_agg = average_metric_dicts(i2i_runs)
-    t2i_agg = average_metric_dicts(t2i_runs)
-    i2t_agg = average_metric_dicts(i2t_runs)
+    print("Evaluating image -> image...")
+    image_query_embeddings = encode_image_queries(
+        image_encoder=image_encoder,
+        image_paths=gallery_paths,
+        gallery_indices=image_query_indices,
+        batch_size=args.batch_size,
+        device=device,
+    )
+    image_ranks = compute_ranks(
+        query_embeddings=image_query_embeddings,
+        target_gallery_indices=image_query_indices,
+        gallery_index=gallery_index,
+        max_k=max_search_k,
+    )
+    image_metrics = metrics_from_ranks(image_ranks, k_values, gallery_index.ntotal)
 
-    i2i_mean = {k: v["mean"] for k, v in i2i_agg.items()}
-    t2i_mean = {k: v["mean"] for k, v in t2i_agg.items()}
-    i2t_mean = {k: v["mean"] for k, v in i2t_agg.items()}
+    print(pretty_metrics("Text -> Image", text_metrics, k_values))
+    print(pretty_metrics("Image -> Image", image_metrics, k_values))
 
-    print("\n=== Retrieval Metrics (mean across passes) ===")
-    print_metric_block("Image->Image", i2i_mean, ks)
-    print_metric_block("Text->Image", t2i_mean, ks)
-    print_metric_block("Image->Text", i2t_mean, ks)
+    text_samples = collect_samples_text_to_image(
+        query_texts=query_texts,
+        target_indices=text_targets,
+        gallery_paths=gallery_paths,
+        query_embeddings=text_query_embeddings,
+        gallery_index=gallery_index,
+        num_samples=args.num_samples,
+        k=args.sample_top_k,
+        seed=args.seed,
+    )
+    image_samples = collect_samples_image_to_image(
+        query_gallery_indices=image_query_indices,
+        gallery_paths=gallery_paths,
+        query_embeddings=image_query_embeddings,
+        gallery_index=gallery_index,
+        num_samples=args.num_samples,
+        k=args.sample_top_k,
+        seed=args.seed,
+    )
 
-    print("\n=== Stability (std across passes) ===")
-    std_line = ", ".join([f"R@{k} std={t2i_agg[f'R@{k}']['std'] * 100:.2f}%" for k in ks])
-    print(f"Text->Image: {std_line}")
-
-    verdict = summarize_quality(t2i_mean)
-    print("\n=== Verdict ===")
-    print(verdict)
-
-    if final_t2i_similarity is not None:
-        print_qualitative_examples(
-            pairs=pairs,
-            similarity=final_t2i_similarity,
-            top_k=max(ks),
-            num_examples=args.num_examples,
-        )
+    print_samples(text_samples, "Manual Check Samples: Text -> Image")
+    print_samples(image_samples, "Manual Check Samples: Image -> Image")
 
     if args.save_json:
-        report = {
-            "checkpoint": str(Path(args.checkpoint)),
-            "config": str(Path(args.config)),
-            "num_pairs": len(pairs),
-            "ks": ks,
-            "eval_passes": int(args.eval_passes),
-            "image_to_image": i2i_agg,
-            "text_to_image": t2i_agg,
-            "image_to_text": i2t_agg,
-            "verdict": verdict,
-            "runs": {
-                "image_to_image": i2i_runs,
-                "text_to_image": t2i_runs,
-                "image_to_text": i2t_runs,
-            },
-        }
         out_path = Path(args.save_json)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
-        print(f"\nSaved evaluation report: {out_path}")
+        save_json_report(
+            out_path=out_path,
+            text_metrics=text_metrics,
+            image_metrics=image_metrics,
+            text_samples=text_samples,
+            image_samples=image_samples,
+        )
+        print(f"\nSaved report: {out_path}")
 
 
 if __name__ == "__main__":

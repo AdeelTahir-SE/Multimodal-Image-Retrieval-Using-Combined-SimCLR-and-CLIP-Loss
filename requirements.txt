@@ -5,3 +5,4 @@ pycocotools
 pillow
 pyyaml
 tqdm
+faiss-cpu
