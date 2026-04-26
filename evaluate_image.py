@@ -1,28 +1,42 @@
 """
 evaluate_image.py  –  Image-to-Image retrieval evaluation on COCO val2017.
 
-The query IS an image. The model encodes it with ImageEncoder, searches the
-FAISS gallery, and we measure how well the retrieved images match the query
-using a *frozen* CLIP (ViT-B/32) as the semantic evaluator.
+Why NOT CLIP-only for image-to-image?
+--------------------------------------
+CLIP was trained on image-text pairs; its image-image cosine similarity is
+biased toward features that correlate with language, not pure visual content.
+For image-to-image retrieval the ground truth is *visual/semantic category
+overlap*, which COCO instance annotations provide directly.
 
-Metrics
--------
-1. Avg CLIP Image-Image Score @ K
-       cos_sim( CLIP_img(query), CLIP_img(retrieved_i) )  averaged over K
-2. Semantic NDCG @ K
-       Graded relevance = CLIP image-image similarity → shifted to [0,1]
-3. Soft Recall @ K
-       ≥1 retrieved image has CLIP similarity ≥ ε to the query image
-4. Exact Recall / Precision / MRR @ K   (self-retrieval baseline)
-       Ground truth = the query image itself; it should appear as rank-1.
-       The query image is EXCLUDED from the gallery to make this non-trivial,
-       or kept in (flag --keep_query_in_gallery) to test rank-1 self-retrieval.
+Metrics used (in priority order)
+---------------------------------
+1. Category Precision@K          [PRIMARY]
+       Fraction of top-K retrieved images sharing ≥1 COCO category with query.
+       Ground truth from instances_val2017.json — the gold standard.
+
+2. Category NDCG@K               [PRIMARY]
+       Graded relevance = Jaccard similarity of category sets between
+       retrieved image and query. Rewards retrieving the most category-similar
+       images highest.
+
+3. Category Recall@K             [PRIMARY]
+       Did the model retrieve at least one image from the same category?
+
+4. Self-Embedding Cosine@K       [MODEL QUALITY]
+       Mean cosine similarity between query embedding and top-K retrieved
+       embeddings — measured INSIDE the trained model's own 128-D space.
+       Tells you how well the embedding space is organised.
+
+5. Exact Self-Retrieval Rank     [SANITY CHECK]
+       When the query image is kept in the gallery (--keep_query_in_gallery),
+       what rank does it appear at? Should be rank 1.
 
 Usage
 -----
 python evaluate_image.py \
     --checkpoint   checkpoints/best.pt \
     --val_images   data/coco/val2017 \
+    --instances    data/coco/annotations/instances_val2017.json \
     --config       config.yaml \
     --top_k        5 \
     --num_queries  500 \
@@ -35,10 +49,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import faiss
 import numpy as np
@@ -50,7 +63,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 from models.image_encoder import ImageEncoder
-from models.text_encoder import TextEncoder   # needed only to load the checkpoint
+from models.text_encoder import TextEncoder   # needed only to load checkpoint cleanly
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Transforms
@@ -62,15 +75,6 @@ RETRIEVAL_TRANSFORM = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
 
-CLIP_MEAN = (0.48145466, 0.4578275,  0.40821073)
-CLIP_STD  = (0.26862954, 0.26130258, 0.27577711)
-CLIP_TRANSFORM = transforms.Compose([
-    transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(CLIP_MEAN, CLIP_STD),
-])
-
 VALID_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
@@ -79,8 +83,7 @@ VALID_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 # ─────────────────────────────────────────────────────────────────────────────
 class PathImageDataset(Dataset):
     def __init__(self, paths: List[Path], tfm):
-        self.paths = paths
-        self.tfm   = tfm
+        self.paths, self.tfm = paths, tfm
 
     def __len__(self):
         return len(self.paths)
@@ -108,58 +111,60 @@ def discover_images(folder: Path) -> List[Path]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# COCO category annotation loader
+# ─────────────────────────────────────────────────────────────────────────────
+def load_coco_categories(instances_json: Path) -> Tuple[
+    Dict[str, Set[int]],   # filename → set of category_ids
+    Dict[int, str],        # category_id → category_name
+]:
+    """
+    Parse instances_val2017.json to build:
+      - image_categories: {filename: {cat_id, ...}}
+      - id2name:          {cat_id: name}
+    """
+    print(f"[COCO] Loading instance annotations from {instances_json} …")
+    with open(instances_json, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    id2file: Dict[int, str] = {img["id"]: img["file_name"] for img in data["images"]}
+    id2name: Dict[int, str] = {cat["id"]: cat["name"] for cat in data["categories"]}
+
+    image_categories: Dict[str, Set[int]] = {}
+    for ann in data["annotations"]:
+        fname = id2file.get(ann["image_id"])
+        if fname is None:
+            continue
+        image_categories.setdefault(fname, set()).add(ann["category_id"])
+
+    print(f"[COCO] {len(image_categories)} images with annotations · "
+          f"{len(id2name)} categories")
+    return image_categories, id2name
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Model loading
 # ─────────────────────────────────────────────────────────────────────────────
 def load_image_encoder(checkpoint: Path, cfg: dict, device: torch.device) -> ImageEncoder:
-    """Load only the ImageEncoder from the checkpoint."""
     img_enc = ImageEncoder(
         embedding_dim=cfg["model"]["embedding_dim"],
         backbone_name=cfg["model"]["image_backbone"],
         use_pretrained=cfg["model"].get("image_pretrained", False),
     ).to(device)
-    # Also instantiate TextEncoder so the checkpoint loads without KeyError
     txt_enc = TextEncoder(
         embedding_dim=cfg["model"]["embedding_dim"],
         model_name=cfg["model"]["text_backbone"],
         use_pretrained=cfg["model"].get("text_pretrained", False),
     ).to(device)
-
     payload = torch.load(checkpoint, map_location=device)
     img_enc.load_state_dict(payload["image_encoder"])
-    txt_enc.load_state_dict(payload["text_encoder"])   # discard after load
+    txt_enc.load_state_dict(payload["text_encoder"])
     img_enc.eval()
     del txt_enc
     return img_enc
 
 
-def load_clip_evaluator(device: torch.device):
-    """Load frozen CLIP ViT-B/32 — try openai/clip first, fall back to HF."""
-    try:
-        import clip
-        model, _ = clip.load("ViT-B/32", device=device)
-        model.eval()
-        print("[Evaluator] Loaded openai/clip ViT-B/32 via `clip` package.")
-        return model, "openai_clip"
-    except ImportError:
-        pass
-
-    try:
-        from transformers import CLIPModel, CLIPProcessor
-        model     = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        model.eval()
-        print("[Evaluator] Loaded openai/clip-vit-base-patch32 via HuggingFace.")
-        return (model, processor), "hf_clip"
-    except Exception as e:
-        raise RuntimeError(
-            "Could not load CLIP evaluator.\n"
-            "Install via:  pip install git+https://github.com/openai/CLIP.git\n"
-            "or:           pip install transformers\n" + str(e)
-        )
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# FAISS gallery
+# FAISS gallery builder — returns index AND raw embeddings
 # ─────────────────────────────────────────────────────────────────────────────
 @torch.no_grad()
 def build_faiss_index(
@@ -169,16 +174,21 @@ def build_faiss_index(
     device: torch.device,
     cache_index: Optional[Path] = None,
     cache_meta:  Optional[Path] = None,
+    cache_emb:   Optional[Path] = None,
     force_rebuild: bool = False,
-) -> Tuple[faiss.Index, List[str]]:
-
-    if (not force_rebuild and cache_index and cache_meta
-            and cache_index.exists() and cache_meta.exists()):
+) -> Tuple[faiss.Index, List[str], np.ndarray]:
+    """
+    Returns (faiss_index, path_list, gallery_embeddings_float32).
+    gallery_embeddings shape: (N, embedding_dim) — L2 normalised.
+    """
+    if (not force_rebuild and cache_index and cache_meta and cache_emb
+            and cache_index.exists() and cache_meta.exists() and cache_emb.exists()):
         print(f"[FAISS] Loading cached index from {cache_index}")
         index = faiss.read_index(str(cache_index))
         with open(cache_meta, "r", encoding="utf-8") as f:
             paths = json.load(f)["paths"]
-        return index, paths
+        embs = np.load(str(cache_emb))
+        return index, paths, embs
 
     print(f"[FAISS] Encoding {len(image_paths)} images …")
     dataset = PathImageDataset(image_paths, RETRIEVAL_TRANSFORM)
@@ -201,42 +211,30 @@ def build_faiss_index(
     index = faiss.IndexFlatIP(gallery.shape[1])
     index.add(gallery)
 
-    if cache_index and cache_meta:
+    if cache_index and cache_meta and cache_emb:
         cache_index.parent.mkdir(parents=True, exist_ok=True)
         faiss.write_index(index, str(cache_index))
         with open(cache_meta, "w", encoding="utf-8") as f:
             json.dump({"paths": all_paths}, f, indent=2)
+        np.save(str(cache_emb), gallery)
         print(f"[FAISS] Index saved → {cache_index}")
 
-    return index, all_paths
+    return index, all_paths, gallery
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLIP image encoder helper
+# Semantic relevance helpers (COCO categories)
 # ─────────────────────────────────────────────────────────────────────────────
-@torch.no_grad()
-def clip_image_embed(
-    image_paths: List[Path],
-    clip_pkg,
-    clip_type: str,
-    device: torch.device,
-) -> torch.Tensor:
-    """Return L2-normalised CLIP image embeddings, shape (N, D)."""
-    if clip_type == "openai_clip":
-        import clip
-        tensors = torch.stack(
-            [CLIP_TRANSFORM(Image.open(p).convert("RGB")) for p in image_paths]
-        ).to(device)
-        feats = clip_pkg.encode_image(tensors).float()
-    else:
-        model, processor = clip_pkg
-        images = [Image.open(p).convert("RGB") for p in image_paths]
-        inputs = processor(images=images, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        # Use vision_model + visual_projection to always get a plain tensor
-        vision_out = model.vision_model(**inputs)
-        feats = model.visual_projection(vision_out.pooler_output).float()
-    return F.normalize(feats, dim=1)
+def jaccard(a: Set[int], b: Set[int]) -> float:
+    """Jaccard similarity between two category sets — used as graded relevance."""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def category_overlap(a: Set[int], b: Set[int]) -> bool:
+    """True if the two images share at least one COCO category."""
+    return bool(a & b)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -256,7 +254,7 @@ def mrr_at_k(hit_ranks: List[Optional[int]], k: int) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main evaluation
+# Main
 # ─────────────────────────────────────────────────────────────────────────────
 @torch.no_grad()
 def evaluate(args):
@@ -273,151 +271,164 @@ def evaluate(args):
     print(f"[Model] Loading ImageEncoder from {checkpoint}")
     img_enc = load_image_encoder(checkpoint, cfg, device)
 
-    # ── 2. Load frozen CLIP evaluator ────────────────────────────────────────
-    print("[Evaluator] Loading frozen CLIP …")
-    clip_pkg, clip_type = load_clip_evaluator(device)
+    # ── 2. Load COCO category annotations ───────────────────────────────────
+    instances_json = Path(args.instances)
+    image_categories, id2name = load_coco_categories(instances_json)
 
-    # ── 3. Discover val images ───────────────────────────────────────────────
-    val_dir = Path(args.val_images)
+    # ── 3. Discover val images that have category annotations ────────────────
+    val_dir    = Path(args.val_images)
     all_images = discover_images(val_dir)
-    print(f"[Gallery] {len(all_images)} val images found in {val_dir}")
+    # Keep only images that have COCO instance annotations
+    annotated  = [p for p in all_images if p.name in image_categories]
+    print(f"[Gallery] {len(all_images)} total val images · "
+          f"{len(annotated)} have category annotations")
 
     # ── 4. Sample queries ────────────────────────────────────────────────────
-    query_pool = list(all_images)
+    query_pool = list(annotated)
     random.shuffle(query_pool)
     queries = query_pool[: args.num_queries]
     print(f"[Queries] {len(queries)} query images selected")
 
-    # ── 5. Build FAISS gallery ───────────────────────────────────────────────
+    # ── 5. Build gallery ─────────────────────────────────────────────────────
     cache_dir   = Path(args.cache_dir)
     cache_index = cache_dir / "val2017_img2img.index"
     cache_meta  = cache_dir / "val2017_img2img.json"
+    cache_emb   = cache_dir / "val2017_img2img_emb.npy"
 
     if args.keep_query_in_gallery:
-        gallery_images = all_images
-        print("[Gallery] Query images KEPT in gallery (self-retrieval test).")
+        gallery_images = annotated
+        print(f"[Gallery] All {len(gallery_images)} annotated images in gallery "
+              f"(self-retrieval mode).")
     else:
-        # Build gallery from images NOT in the query set so rank-1 ≠ trivial self-match
-        query_names = {p.name for p in queries}
-        gallery_images = [p for p in all_images if p.name not in query_names]
+        query_names    = {p.name for p in queries}
+        gallery_images = [p for p in annotated if p.name not in query_names]
         print(f"[Gallery] {len(gallery_images)} gallery images "
-              f"(query images excluded — hard evaluation).")
+              f"(query images excluded — hard mode).")
 
-    gallery_index, gallery_paths = build_faiss_index(
+    gallery_index, gallery_paths, gallery_embs = build_faiss_index(
         img_enc, gallery_images, args.batch_size, device,
-        cache_index, cache_meta, force_rebuild=args.rebuild_cache,
+        cache_index, cache_meta, cache_emb,
+        force_rebuild=args.rebuild_cache,
     )
-    path2name = {Path(p).name: i for i, p in enumerate(gallery_paths)}
 
     K   = args.top_k
-    eps = args.soft_recall_eps
+    emb_dim = gallery_embs.shape[1]
 
-    # ── 6. Per-query evaluation ──────────────────────────────────────────────
-    clip_scores:   List[float]         = []
-    ndcg_scores:   List[float]         = []
-    soft_hits:     List[float]         = []
-    exact_recalls: List[float]         = []
-    exact_precs:   List[float]         = []
-    hit_ranks:     List[Optional[int]] = []
+    # ── 6. Evaluation loop ───────────────────────────────────────────────────
+    # Accumulators
+    cat_precisions: List[float]         = []   # Metric 1
+    cat_ndcg:       List[float]         = []   # Metric 2
+    cat_recalls:    List[float]         = []   # Metric 3
+    self_emb_sims:  List[float]         = []   # Metric 4
+    exact_hit_ranks: List[Optional[int]] = []  # Metric 5 (sanity)
 
     print(f"\n[Eval] Running {len(queries)} queries (top_k={K}) …\n")
 
     for qi, qpath in enumerate(queries):
+        q_cats = image_categories.get(qpath.name, set())
+
         # ── Encode query with retrieval model ──
         q_img = RETRIEVAL_TRANSFORM(Image.open(qpath).convert("RGB")).unsqueeze(0).to(device)
         q_emb = F.normalize(img_enc(q_img), dim=1)
         q_np  = _to_f32(q_emb).reshape(1, -1)
         faiss.normalize_L2(q_np)
 
-        _, topk_idxs = gallery_index.search(q_np, min(K, gallery_index.ntotal))
-        topk_idxs    = topk_idxs[0].tolist()
-        retrieved     = [Path(gallery_paths[i]) for i in topk_idxs]
+        scores_np, topk_idxs_np = gallery_index.search(q_np, min(K, gallery_index.ntotal))
+        topk_idxs  = topk_idxs_np[0].tolist()
+        topk_scores = scores_np[0].tolist()          # cosine similarities from FAISS
+        retrieved  = [Path(gallery_paths[i]) for i in topk_idxs]
 
-        # ── METRIC 4: Exact self-retrieval ──
-        # Ground truth: a gallery image with the same filename as the query.
-        hit_rank   = None
-        exact_hits = 0
+        # ── METRIC 4: Self-embedding cosine similarity ──
+        # Mean cosine similarity in the model's OWN embedding space
+        self_emb_sims.append(float(np.mean(topk_scores)))
+
+        # ── METRIC 5: Exact self-retrieval (only meaningful if keep_query_in_gallery) ──
+        hit_rank = None
         for rank, rp in enumerate(retrieved, 1):
             if rp.name == qpath.name:
-                if hit_rank is None:
-                    hit_rank = rank
-                exact_hits += 1
-        exact_recalls.append(1.0 if hit_rank is not None else 0.0)
-        exact_precs.append(exact_hits / K)
-        hit_ranks.append(hit_rank)
+                hit_rank = rank
+                break
+        exact_hit_ranks.append(hit_rank)
 
-        # ── CLIP embeddings ──
-        query_clip = clip_image_embed([qpath], clip_pkg, clip_type, device)      # (1, D)
-        ret_clip   = clip_image_embed(retrieved, clip_pkg, clip_type, device)    # (K, D)
-        sims       = (query_clip @ ret_clip.T).squeeze(0)                        # (K,)
+        # ── Get categories for retrieved images ──
+        ret_cats = [image_categories.get(rp.name, set()) for rp in retrieved]
 
-        # ── METRIC 1: Avg CLIP Image-Image Score @ K ──
-        clip_scores.append(sims.mean().item())
+        # ── METRIC 1: Category Precision@K ──
+        hits = [1.0 if category_overlap(q_cats, rc) else 0.0 for rc in ret_cats]
+        cat_precisions.append(float(np.mean(hits)))
 
-        # ── METRIC 2: Semantic NDCG @ K ──
-        relevances = ((sims + 1.0) / 2.0).cpu().tolist()   # shift [-1,1] → [0,1]
-        ndcg_scores.append(ndcg_at_k(relevances, K))
+        # ── METRIC 2: Category NDCG@K  (Jaccard = graded relevance) ──
+        relevances = [jaccard(q_cats, rc) for rc in ret_cats]
+        cat_ndcg.append(ndcg_at_k(relevances, K))
 
-        # ── METRIC 3: Soft Recall @ K ──
-        threshold = 2.0 * eps - 1.0                          # back to [-1,1] scale
-        soft_hits.append(1.0 if sims.max().item() >= threshold else 0.0)
+        # ── METRIC 3: Category Recall@K ──
+        # Did we find at least one image sharing a category?
+        cat_recalls.append(1.0 if any(category_overlap(q_cats, rc) for rc in ret_cats) else 0.0)
 
         if (qi + 1) % 50 == 0 or (qi + 1) == len(queries):
             print(f"  [{qi+1:4d}/{len(queries)}] "
-                  f"CLIP@{K}={np.mean(clip_scores):.4f}  "
-                  f"NDCG@{K}={np.mean(ndcg_scores):.4f}  "
-                  f"SoftR@{K}={np.mean(soft_hits):.4f}  "
-                  f"ExactR@{K}={np.mean(exact_recalls):.4f}")
+                  f"CatP@{K}={np.mean(cat_precisions):.4f}  "
+                  f"CatNDCG@{K}={np.mean(cat_ndcg):.4f}  "
+                  f"CatR@{K}={np.mean(cat_recalls):.4f}  "
+                  f"EmbSim@{K}={np.mean(self_emb_sims):.4f}")
 
-    # ── 7. Aggregate ─────────────────────────────────────────────────────────
-    results: dict = {
-        "num_queries":         len(queries),
-        "gallery_size":        len(gallery_paths),
-        "top_k":               K,
-        "soft_recall_epsilon": eps,
-        "keep_query_in_gallery": args.keep_query_in_gallery,
-        "metrics": {
-            f"avg_clip_score@{K}":  round(float(np.mean(clip_scores)),   6),
-            f"semantic_ndcg@{K}":   round(float(np.mean(ndcg_scores)),   6),
-            f"soft_recall@{K}":     round(float(np.mean(soft_hits)),      6),
-            f"exact_recall@{K}":    round(float(np.mean(exact_recalls)),  6),
-            f"exact_precision@{K}": round(float(np.mean(exact_precs)),    6),
-            f"mrr@{K}":             round(mrr_at_k(hit_ranks, K),         6),
-        },
-        "per_k_breakdown": {},
-    }
-
+    # ── 7. Per-K breakdown ───────────────────────────────────────────────────
+    per_k: dict = {}
     for k_sub in [1, 3, 5, 10]:
         if k_sub > K:
             break
-        sub_r, sub_p = [], []
-        for hr in hit_ranks:
-            hit = hr is not None and hr <= k_sub
-            sub_r.append(1.0 if hit else 0.0)
-            sub_p.append((1.0 / k_sub) if hit else 0.0)
-        results["per_k_breakdown"][f"R@{k_sub}"] = round(float(np.mean(sub_r)), 6)
-        results["per_k_breakdown"][f"P@{k_sub}"] = round(float(np.mean(sub_p)), 6)
+        # Re-compute by re-running per query is expensive; approximate from hit_ranks
+        # For category metrics we'd need to redo, so report exact self-retrieval per-K
+        sub_r = [1.0 if (r is not None and r <= k_sub) else 0.0
+                 for r in exact_hit_ranks]
+        per_k[f"exact_self_retrieval@{k_sub}"] = round(float(np.mean(sub_r)), 6)
 
-    # ── 8. Print summary ─────────────────────────────────────────────────────
-    print("\n" + "=" * 62)
+    # ── 8. Aggregate results ─────────────────────────────────────────────────
+    results = {
+        "num_queries":           len(queries),
+        "gallery_size":          len(gallery_paths),
+        "top_k":                 K,
+        "keep_query_in_gallery": args.keep_query_in_gallery,
+        "metrics": {
+            f"category_precision@{K}":     round(float(np.mean(cat_precisions)), 6),
+            f"category_ndcg@{K}":          round(float(np.mean(cat_ndcg)),       6),
+            f"category_recall@{K}":        round(float(np.mean(cat_recalls)),     6),
+            f"self_embedding_cosine@{K}":  round(float(np.mean(self_emb_sims)),  6),
+            f"exact_self_retrieval@{K}":   round(
+                float(np.mean([1.0 if r is not None else 0.0 for r in exact_hit_ranks])), 6),
+            f"mrr@{K}":                    round(mrr_at_k(exact_hit_ranks, K),   6),
+        },
+        "per_k_breakdown": per_k,
+    }
+
+    # ── 9. Print summary ─────────────────────────────────────────────────────
+    mode = "self-retrieval" if args.keep_query_in_gallery else "hard (query excluded)"
+    print("\n" + "=" * 64)
     print("  IMAGE-TO-IMAGE EVALUATION  –  COCO val2017")
-    print("=" * 62)
-    print(f"  Queries       : {results['num_queries']}")
-    print(f"  Gallery size  : {results['gallery_size']}")
-    print(f"  Top-K         : {K}")
-    print(f"  Soft-Recall ε : {eps}  (on [0,1] cosine scale)")
-    keep_str = "YES (self-retrieval test)" if args.keep_query_in_gallery else "NO  (hard eval)"
-    print(f"  Query in gallery : {keep_str}")
-    print("-" * 62)
+    print("=" * 64)
+    print(f"  Queries        : {results['num_queries']}")
+    print(f"  Gallery size   : {results['gallery_size']}")
+    print(f"  Top-K          : {K}")
+    print(f"  Mode           : {mode}")
+    print("-" * 64)
+    desc = {
+        f"category_precision@{K}":    "% of top-K sharing ≥1 COCO category  [PRIMARY]",
+        f"category_ndcg@{K}":         "Jaccard-graded NDCG ranking score     [PRIMARY]",
+        f"category_recall@{K}":       "Query answered by ≥1 same-cat image   [PRIMARY]",
+        f"self_embedding_cosine@{K}": "Mean cosine sim in model's own space   [MODEL]",
+        f"exact_self_retrieval@{K}":  "Exact image found in top-K (sanity)   [SANITY]",
+        f"mrr@{K}":                   "Mean Reciprocal Rank of exact image    [SANITY]",
+    }
     for name, val in results["metrics"].items():
-        print(f"  {name:<30s}: {val:.6f}")
-    print("-" * 62)
-    print("  Per-K breakdown:")
-    for name, val in results["per_k_breakdown"].items():
-        print(f"    {name:<10s}: {val:.6f}")
-    print("=" * 62)
+        print(f"  {val:.6f}  {name:<35s}  {desc.get(name,'')}")
+    if per_k:
+        print("-" * 64)
+        print("  Per-K self-retrieval breakdown:")
+        for k, v in per_k.items():
+            print(f"    {k:<35s}: {v:.6f}")
+    print("=" * 64)
 
-    # ── 9. Save report ────────────────────────────────────────────────────────
+    # ── 10. Save report ───────────────────────────────────────────────────────
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
@@ -430,21 +441,22 @@ def evaluate(args):
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Image-to-image retrieval evaluation on COCO val2017"
+        description="Image-to-image retrieval evaluation using COCO category semantics"
     )
-    p.add_argument("--checkpoint",    default="checkpoints/best.pt")
-    p.add_argument("--config",        default="config.yaml")
-    p.add_argument("--val_images",    default="data/coco/val2017")
-    p.add_argument("--top_k",         type=int,   default=5)
-    p.add_argument("--num_queries",   type=int,   default=500)
-    p.add_argument("--batch_size",    type=int,   default=32)
-    p.add_argument("--soft_recall_eps", type=float, default=0.80)
-    p.add_argument("--cache_dir",     default=".cache/eval_img2img")
+    p.add_argument("--checkpoint",  default="checkpoints/best.pt")
+    p.add_argument("--config",      default="config.yaml")
+    p.add_argument("--val_images",  default="data/coco/val2017")
+    p.add_argument("--instances",   default="data/coco/annotations/instances_val2017.json",
+                   help="COCO instances_val2017.json for category ground truth")
+    p.add_argument("--top_k",       type=int,   default=5)
+    p.add_argument("--num_queries", type=int,   default=500)
+    p.add_argument("--batch_size",  type=int,   default=32)
+    p.add_argument("--cache_dir",   default=".cache/eval_img2img")
     p.add_argument("--rebuild_cache", action="store_true")
     p.add_argument("--keep_query_in_gallery", action="store_true",
-                   help="Keep query images in the gallery (self-retrieval / rank-1 test).")
-    p.add_argument("--out",           default="checkpoints/eval_image2image.json")
-    p.add_argument("--seed",          type=int,   default=42)
+                   help="Include query images in gallery for self-retrieval test.")
+    p.add_argument("--out",         default="checkpoints/eval_image2image.json")
+    p.add_argument("--seed",        type=int,   default=42)
     return p.parse_args()
 
 

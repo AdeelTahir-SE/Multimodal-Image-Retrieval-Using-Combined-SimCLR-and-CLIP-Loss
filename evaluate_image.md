@@ -1,3 +1,5 @@
+
+
 # Evaluation Pipeline — `evaluate_image.py`
 
 Image-to-image retrieval evaluation for the **Multimodal Image Retrieval (SimCLR + CLIP)** model on **COCO val2017**.  
